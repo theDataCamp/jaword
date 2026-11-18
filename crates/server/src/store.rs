@@ -99,6 +99,10 @@ struct SealRecord {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Meta {
+    /// Human-friendly name shown in the UI, e.g. "Proxmox root". The path is
+    /// the unique address; the title is free text.
+    #[serde(default)]
+    pub title: String,
     #[serde(default)]
     pub username: String,
     #[serde(default)]
@@ -114,7 +118,7 @@ pub struct Meta {
 
 impl Meta {
     fn validate(&self) -> R<()> {
-        if self.username.len() > 256 || self.url.len() > 2048 || self.notes.len() > 8192 {
+        if self.title.len() > 200 || self.username.len() > 256 || self.url.len() > 2048 || self.notes.len() > 8192 {
             return bad("metadata field too long");
         }
         if self.tags.len() > 32 || self.tags.iter().any(|t| t.is_empty() || t.len() > 64) {

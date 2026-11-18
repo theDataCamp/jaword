@@ -660,6 +660,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "clap",
+ "jaword-core",
  "rpassword",
  "serde",
  "serde_json",

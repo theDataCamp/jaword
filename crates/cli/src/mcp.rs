@@ -36,6 +36,7 @@ fn tools() -> Value {
             "inputSchema": {"type": "object", "properties": {
                 "path": path,
                 "kind": {"type": "string", "enum": ["password", "api_key", "ssh_key", "config", "note"]},
+                "title": {"type": "string", "description": "Friendly name, e.g. Proxmox root"},
                 "username": {"type": "string"},
                 "url": {"type": "string"},
                 "notes": {"type": "string"},
@@ -46,9 +47,10 @@ fn tools() -> Value {
         },
         {
             "name": "secret_update_metadata",
-            "description": "Change a secret's username, url, notes or tags. Omitted fields are kept.",
+            "description": "Change a secret's title, username, url, notes or tags. Omitted fields are kept.",
             "inputSchema": {"type": "object", "properties": {
                 "path": path,
+                "title": {"type": "string"},
                 "username": {"type": "string"},
                 "url": {"type": "string"},
                 "notes": {"type": "string"},
@@ -64,6 +66,25 @@ fn tools() -> Value {
             "name": "secret_rotate",
             "description": "Rotate a credential end to end: the vault generates a new value, applies it to the target system through the secret's configured driver, and makes it current only if that succeeds. On failure the previous value stays current. Returns the new version number, never the value.",
             "inputSchema": {"type": "object", "properties": {"path": path}, "required": ["path"]}
+        },
+        {
+            "name": "secret_import_file",
+            "description": "Import a CSV export from another password manager (1Password, Bitwarden, Chrome, Firefox, LastPass, KeePassXC) into the vault. The file is read by this tool, not by you: do NOT open, cat or read the file yourself, it contains plain-text passwords. Returns counts and the created paths only. Run with dry_run first. Needs `create` and `write` on the target prefix.",
+            "inputSchema": {"type": "object", "properties": {
+                "file": {"type": "string", "description": "Absolute path of the CSV export on this machine"},
+                "prefix": {"type": "string", "description": "Folder to import into, e.g. logins (default: imported)"},
+                "dry_run": {"type": "boolean"},
+                "remove_source": {"type": "boolean", "description": "Delete the export file after a fully successful import"}
+            }, "required": ["file"]}
+        },
+        {
+            "name": "secret_export_inventory",
+            "description": "Write an inventory of secrets (title, site, username, tags, path, version; no values) to a CSV or JSON file. A full export including values can only be done by a human with `jaword export`.",
+            "inputSchema": {"type": "object", "properties": {
+                "out": {"type": "string", "description": "Absolute output file path"},
+                "format": {"type": "string", "enum": ["csv", "json"]},
+                "prefix": {"type": "string"}
+            }, "required": ["out"]}
         },
         {
             "name": "secret_delete",
@@ -91,6 +112,7 @@ fn call(c: &Client, name: &str, args: &Value) -> Result<Value, ApiError> {
                 "path": arg(args, "path")?,
                 "kind": args["kind"].as_str().unwrap_or("password"),
                 "meta": {
+                    "title": args["title"].as_str().unwrap_or(""),
                     "username": args["username"].as_str().unwrap_or(""),
                     "url": args["url"].as_str().unwrap_or(""),
                     "notes": args["notes"].as_str().unwrap_or(""),
@@ -108,7 +130,7 @@ fn call(c: &Client, name: &str, args: &Value) -> Result<Value, ApiError> {
         "secret_update_metadata" => {
             let path = arg(args, "path")?;
             let mut meta = c.get_secret(path)?["meta"].clone();
-            for k in ["username", "url", "notes", "tags"] {
+            for k in ["title", "username", "url", "notes", "tags"] {
                 if let Some(v) = args.get(k).filter(|v| !v.is_null()) {
                     meta[k] = v.clone();
                 }
@@ -123,6 +145,24 @@ fn call(c: &Client, name: &str, args: &Value) -> Result<Value, ApiError> {
             c.post("/v1/secrets/generate", &body)
         }
         "secret_rotate" => c.post("/v1/secrets/rotate", &json!({"path": arg(args, "path")?})),
+        "secret_import_file" => crate::transfer::import_file(
+            c,
+            &crate::transfer::ImportOpts {
+                file: arg(args, "file")?.into(),
+                prefix: args["prefix"].as_str().unwrap_or("imported").to_string(),
+                dry_run: args["dry_run"].as_bool().unwrap_or(false),
+                remove_source: args["remove_source"].as_bool().unwrap_or(false),
+            },
+        )
+        .map_err(|m| ApiError { status: 400, message: m }),
+        "secret_export_inventory" => crate::transfer::export(
+            c,
+            std::path::Path::new(arg(args, "out")?),
+            args["format"].as_str().unwrap_or("csv"),
+            args["prefix"].as_str().unwrap_or(""),
+            true,
+        )
+        .map_err(|m| ApiError { status: 400, message: m }),
         "secret_delete" => c.post("/v1/secrets/delete", &json!({"path": arg(args, "path")?})),
         _ => Err(ApiError { status: 404, message: format!("unknown tool `{name}`") }),
     }

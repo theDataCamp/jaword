@@ -74,6 +74,11 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); box-sha
 .item.on { box-shadow: inset 2px 0 0 var(--accent); }
 .item .p { font: 13px var(--mono); overflow-wrap: anywhere; }
 .item .p .dir { color: var(--dim); }
+.item .ttl { font-weight: 600; margin-bottom: 1px; overflow-wrap: anywhere; }
+.panel h3.plain { font-family: var(--sans); font-size: 17px; }
+.panel a { color: var(--accent); text-decoration: none; }
+.panel a:hover { text-decoration: underline; }
+textarea.code { min-height: 190px; white-space: pre; }
 .item .m { color: var(--muted); font-size: 12px; margin-top: 2px; display: flex; gap: 8px; flex-wrap: wrap; }
 .empty { color: var(--muted); padding: 28px 16px; text-align: center; }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 18px; }

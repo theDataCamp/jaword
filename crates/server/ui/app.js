@@ -155,7 +155,7 @@ function fail(e) {
 async function viewSecrets(main) {
   const listEl = h("div", { class: "list" });
   const detailEl = h("div", {});
-  const search = h("input", { type: "search", placeholder: "Filter by path, user or tag", value: state.filter, "aria-label": "Filter secrets",
+  const search = h("input", { type: "search", placeholder: "Search name, path, site, user or tag", value: state.filter, "aria-label": "Filter secrets",
     oninput: (e) => { state.filter = e.target.value; renderList(); } });
   main.replaceChildren(
     h("div", { class: "head" }, h("h2", {}, "Secrets"), h("div", { class: "grow" }, search),
@@ -164,11 +164,12 @@ async function viewSecrets(main) {
 
   function renderList() {
     const q = state.filter.trim().toLowerCase();
-    const rows = state.secrets.filter((s) => !q || s.path.includes(q) || s.meta.username.toLowerCase().includes(q) || s.meta.tags.some((t) => t.toLowerCase().includes(q)));
+    const rows = state.secrets.filter((s) => !q || s.path.includes(q) || (s.meta.title || "").toLowerCase().includes(q) || s.meta.url.toLowerCase().includes(q) || s.meta.username.toLowerCase().includes(q) || s.meta.tags.some((t) => t.toLowerCase().includes(q)));
     if (!rows.length) return listEl.replaceChildren(h("div", { class: "empty" }, state.secrets.length ? "Nothing matches." : "No secrets yet."));
     listEl.replaceChildren(...rows.map((s) => {
       const i = s.path.lastIndexOf("/");
       return h("button", { class: "item" + (state.selected === s.path ? " on" : ""), onclick: () => { state.selected = s.path; renderList(); renderDetail(); } },
+        s.meta.title && h("div", { class: "ttl" }, s.meta.title),
         h("div", { class: "p" }, h("span", { class: "dir" }, s.path.slice(0, i + 1)), s.path.slice(i + 1)),
         h("div", { class: "m" }, h("span", {}, s.kind), h("span", {}, "v" + s.current_version), s.meta.username && h("span", {}, s.meta.username),
           s.has_driver && h("span", { class: "pill" }, "auto-rotate"), s.pending_rotation && h("span", { class: "pill pending" }, "pending")));
@@ -226,7 +227,8 @@ function secretPanel(d, reload) {
   }
   const m = d.meta;
   return h("div", { class: "panel" },
-    h("h3", {}, d.path),
+    h("h3", { class: m.title ? "plain" : null }, m.title || d.path),
+    m.title && h("div", { class: "hint mono" }, d.path),
     h("div", { class: "row" }, h("span", { class: "pill" }, d.kind), h("span", { class: "pill current" }, "v" + d.current_version),
       d.has_driver && h("span", { class: "pill" }, "auto-rotate"), d.pending_rotation && h("span", { class: "pill pending" }, "rotation pending")),
     h("div", { class: "secretbox" }, val,
@@ -235,7 +237,7 @@ function secretPanel(d, reload) {
     note,
     h("dl", { class: "kv" },
       h("dt", {}, "Username"), h("dd", {}, m.username || "—"),
-      h("dt", {}, "URL"), h("dd", {}, m.url || "—"),
+      h("dt", {}, "Website"), h("dd", {}, /^https?:\/\//i.test(m.url) ? h("a", { href: m.url, target: "_blank", rel: "noopener noreferrer" }, m.url) : m.url || "—"),
       h("dt", {}, "Tags"), h("dd", {}, m.tags.length ? m.tags.map((t) => h("span", { class: "pill" }, t)) : "—"),
       h("dt", {}, "Notes"), h("dd", {}, m.notes || "—"),
       h("dt", {}, "Updated"), h("dd", {}, fmt(d.updated_at)),
@@ -244,6 +246,7 @@ function secretPanel(d, reload) {
       d.has_driver && h("button", { class: "btn primary", onclick: () => confirm(`Rotate ${d.path} on the live system now?`) && act("rotate", "/v1/secrets/rotate", { path: d.path }, "Rotated") }, "Rotate now"),
       h("button", { class: "btn", onclick: () => confirm("Generate a new value in the vault only? The live system is not changed.") && act("gen", "/v1/secrets/generate", { path: d.path }, "New version generated") }, "Generate new version"),
       h("button", { class: "btn", onclick: () => secretDialog(d, reload) }, "Edit"),
+      isAdmin() && h("button", { class: "btn", onclick: () => driverDialog(d, reload) }, d.has_driver ? "Rotation setup" : "Set up rotation"),
       d.pending_rotation && isAdmin() && h("button", { class: "btn", onclick: () => confirm("Promote the pending version to current?") && act("res", "/v1/secrets/resolve", { path: d.path, promote: true }, "Promoted") }, "Promote pending"),
       d.pending_rotation && isAdmin() && h("button", { class: "btn", onclick: () => confirm("Discard the pending version?") && act("res", "/v1/secrets/resolve", { path: d.path, promote: false }, "Discarded") }, "Discard pending"),
       h("button", { class: "btn danger ghost", onclick: () => confirm(`Delete ${d.path}?`) && act("del", "/v1/secrets/delete", { path: d.path }, "Deleted") }, "Delete")),
@@ -257,12 +260,15 @@ function secretPanel(d, reload) {
 }
 
 function secretDialog(existing, done) {
-  const m = existing ? existing.meta : { username: "", url: "", notes: "", tags: [] };
+  const m = existing ? existing.meta : { title: "", username: "", url: "", notes: "", tags: [] };
+  const slug = (t) => t.toLowerCase().normalize("NFKD").replace(/[^a-z0-9._-]+/g, "-").replace(/^[^a-z0-9]+|-+$/g, "").slice(0, 60);
+  let pathTouched = !!existing;
   const f = {
+    title: h("input", { type: "text", placeholder: "Proxmox root login", value: m.title || "", autocomplete: "off", maxlength: "200", autofocus: true }),
     path: h("input", { type: "text", placeholder: "infra/pve/root", value: existing ? existing.path : "", disabled: !!existing, required: true, spellcheck: "false", autocomplete: "off" }),
     kind: h("select", { disabled: !!existing }, ["password", "api_key", "ssh_key", "config", "note"].map((k) => h("option", { value: k, selected: existing && existing.kind === k }, k))),
     username: h("input", { type: "text", value: m.username, autocomplete: "off" }),
-    url: h("input", { type: "text", value: m.url, autocomplete: "off" }),
+    url: h("input", { type: "text", value: m.url, placeholder: "https://…", autocomplete: "off" }),
     tags: h("input", { type: "text", value: m.tags.join(", "), placeholder: "comma separated", autocomplete: "off" }),
     notes: h("textarea", {}, m.notes),
     own: h("input", { type: "checkbox" }),
@@ -275,10 +281,12 @@ function secretDialog(existing, done) {
   const genRow = h("div", { class: "two", hidden: !!existing },
     h("div", {}, h("label", {}, "Length"), f.length), h("label", { class: "check" }, f.symbols, "Include symbols"));
   f.own.addEventListener("change", () => { valueRow.hidden = !f.own.checked; genRow.hidden = f.own.checked; });
+  f.path.addEventListener("input", () => { pathTouched = true; });
+  f.title.addEventListener("input", () => { if (!pathTouched) f.path.value = (f.kind.value === "password" ? "logins/" : "infra/") + slug(f.title.value); });
   const dlg = h("dialog", {},
     h("form", { onsubmit: async (e) => {
       e.preventDefault(); err.textContent = "";
-      const meta = { username: f.username.value, url: f.url.value, notes: f.notes.value, tags: f.tags.value.split(",").map((t) => t.trim()).filter(Boolean) };
+      const meta = { title: f.title.value.trim(), username: f.username.value, url: f.url.value, notes: f.notes.value, tags: f.tags.value.split(",").map((t) => t.trim()).filter(Boolean) };
       if (existing && existing.meta.policy) meta.policy = existing.meta.policy;
       try {
         if (existing) {
@@ -296,14 +304,46 @@ function secretDialog(existing, done) {
       } catch (ex) { err.textContent = ex.message; }
     } },
       h("h3", {}, existing ? "Edit secret" : "New secret"),
+      h("label", {}, "Name"), f.title,
+      h("div", { class: "two" }, h("div", {}, h("label", {}, "Username"), f.username), h("div", {}, h("label", {}, "Website"), f.url)),
       h("div", { class: "two" }, h("div", {}, h("label", {}, "Path"), f.path), h("div", {}, h("label", {}, "Kind"), f.kind)),
-      h("div", { class: "two" }, h("div", {}, h("label", {}, "Username"), f.username), h("div", {}, h("label", {}, "URL"), f.url)),
+      !existing && h("p", { class: "hint" }, "The path is this item's unique address, like a folder and file name. Agents and access rules refer to it (for example: allow rotate on infra/**)."),
       h("label", {}, "Tags"), f.tags, h("label", {}, "Notes"), f.notes,
       !existing && h("label", { class: "check" }, f.own, "I'll provide the value (otherwise the vault generates it)"),
       genRow, valueRow, err,
       h("div", { class: "row", style: null }, h("button", { class: "btn primary", type: "submit" }, existing ? "Save" : "Create"),
         h("button", { class: "btn ghost", type: "button", onclick: () => { dlg.close(); dlg.remove(); } }, "Cancel"))));
   document.body.append(dlg);
+  dlg.addEventListener("close", () => dlg.remove());
+  dlg.showModal();
+}
+
+function driverDialog(d, done) {
+  const presets = {
+    ssh: { type: "ssh", host: "server-name", user: "root", command: "chpasswd", stdin: "{{username}}:{{new}}\n", timeout_secs: 30 },
+    exec: { type: "exec", argv: ["/usr/local/bin/rotate-script"], stdin: "{{new}}", timeout_secs: 30 },
+  };
+  const text = h("textarea", { spellcheck: "false", class: "mono code" }, JSON.stringify(d.driver || presets.ssh, null, 2));
+  const err = h("div", { class: "error" });
+  const close = () => { dlg.close(); dlg.remove(); };
+  async function save(driver) {
+    err.textContent = "";
+    try { await api("POST", "/v1/secrets/driver", { path: d.path, driver }); close(); toast(driver ? "Rotation set up" : "Rotation removed"); done(); }
+    catch (ex) { err.textContent = ex.message; }
+  }
+  const dlg = h("dialog", {},
+    h("h3", {}, "Rotation for " + d.path),
+    h("p", { class: "hint" }, "How the vault pushes a new value to the real system. The secret is sent on the command's standard input only. Placeholders: {{new}}, {{old}}, {{username}}."),
+    h("div", { class: "row" },
+      h("button", { class: "btn small", type: "button", onclick: () => { text.value = JSON.stringify(presets.ssh, null, 2); } }, "SSH template"),
+      h("button", { class: "btn small", type: "button", onclick: () => { text.value = JSON.stringify(presets.exec, null, 2); } }, "Local program template")),
+    h("label", {}, "Driver (JSON)"), text, err,
+    h("div", { class: "row" },
+      h("button", { class: "btn primary", type: "button", onclick: () => { let j; try { j = JSON.parse(text.value); } catch (ex) { err.textContent = "Not valid JSON: " + ex.message; return; } save(j); } }, "Save"),
+      d.has_driver && h("button", { class: "btn danger ghost", type: "button", onclick: () => confirm("Remove rotation setup for this secret?") && save(null) }, "Remove"),
+      h("button", { class: "btn ghost", type: "button", onclick: close }, "Cancel")));
+  document.body.append(dlg);
+  dlg.addEventListener("close", () => dlg.remove());
   dlg.showModal();
 }
 
@@ -374,6 +414,7 @@ function tokenDialog(done) {
   const dlg = h("dialog", {}, form);
   document.body.append(dlg);
   sync();
+  dlg.addEventListener("close", () => dlg.remove());
   dlg.showModal();
 }
 

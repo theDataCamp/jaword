@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod mcp;
+mod transfer;
 
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
@@ -48,6 +49,9 @@ enum Cmd {
     /// Create a secret; the vault generates the value unless --prompt/--stdin
     New {
         path: String,
+        /// Friendly name shown in the UI, e.g. "Proxmox root"
+        #[arg(long, default_value = "")]
+        title: String,
         #[arg(long, default_value = "password")]
         kind: String,
         #[arg(long, default_value = "")]
@@ -76,6 +80,8 @@ enum Cmd {
     /// Edit metadata
     Edit {
         path: String,
+        #[arg(long)]
+        title: Option<String>,
         #[arg(long)]
         username: Option<String>,
         #[arg(long)]
@@ -126,6 +132,32 @@ enum Cmd {
         file: Option<PathBuf>,
         #[arg(long)]
         clear: bool,
+    },
+    /// Import a CSV export from 1Password, Bitwarden, Chrome, Firefox, LastPass or KeePassXC
+    Import {
+        file: PathBuf,
+        /// Folder to import into, e.g. `logins` gives logins/github-com
+        #[arg(long, default_value = "imported")]
+        prefix: String,
+        /// Show what would be created without creating anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Delete the export file after a fully successful import
+        #[arg(long)]
+        remove_source: bool,
+    },
+    /// Export to a CSV or JSON file other password managers can import
+    Export {
+        /// Output file (created private, mode 0600)
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value = "csv")]
+        format: String,
+        #[arg(long, default_value = "")]
+        prefix: String,
+        /// Names, sites and usernames only, no secret values (works for agent tokens)
+        #[arg(long)]
+        metadata_only: bool,
     },
     /// Manage API tokens (admin)
     Token {
@@ -295,12 +327,16 @@ impl Client {
 
     pub fn post(&self, path: &str, body: &Value) -> Result<Value, ApiError> {
         let text = Zeroizing::new(body.to_string());
+        self.post_raw(path, &text)
+    }
+
+    pub fn post_raw(&self, path: &str, text: &str) -> Result<Value, ApiError> {
         let r = self
             .agent
             .post(format!("{}{}", self.addr, path))
             .header("Authorization", self.auth())
             .header("Content-Type", "application/json")
-            .send(text.as_str());
+            .send(text);
         self.finish(r)
     }
 
@@ -483,6 +519,9 @@ fn main() {
             if raw {
                 out(&v)
             } else {
+                if !s(&v["meta"]["title"]).is_empty() {
+                    println!("name:     {}", s(&v["meta"]["title"]));
+                }
                 println!("path:     {}\nkind:     {}\nusername: {}\nurl:      {}\ntags:     {}", s(&v["path"]), s(&v["kind"]), s(&v["meta"]["username"]), s(&v["meta"]["url"]), v["meta"]["tags"]);
                 if !s(&v["meta"]["notes"]).is_empty() {
                     println!("notes:    {}", s(&v["meta"]["notes"]));
@@ -494,8 +533,8 @@ fn main() {
                 }
             }
         }
-        Cmd::New { path, kind, username, url, notes, tags, prompt, stdin, policy } => {
-            let mut body = json!({"path": path, "kind": kind, "meta": {"username": username, "url": url, "notes": notes, "tags": tags}});
+        Cmd::New { path, title, kind, username, url, notes, tags, prompt, stdin, policy } => {
+            let mut body = json!({"path": path, "kind": kind, "meta": {"title": title, "username": username, "url": url, "notes": notes, "tags": tags}});
             if let Some(p) = policy.to_json() {
                 body["policy"] = p;
             }
@@ -517,9 +556,12 @@ fn main() {
             let v = check(c.post("/v1/secrets/update", &json!({"path": path, "value": value.as_str()})));
             println!("stored {} v{}", s(&v["path"]), v["current_version"]);
         }
-        Cmd::Edit { path, username, url, notes, tags } => {
+        Cmd::Edit { path, title, username, url, notes, tags } => {
             let cur = check(c.get_secret(&path));
             let mut meta = cur["meta"].clone();
+            if let Some(x) = title {
+                meta["title"] = json!(x);
+            }
             if let Some(x) = username {
                 meta["username"] = json!(x);
             }
@@ -596,6 +638,16 @@ fn main() {
             check(c.post("/v1/secrets/driver", &json!({"path": path, "driver": driver})));
             println!("driver {} for {path}", if clear { "cleared" } else { "saved" });
         }
+        Cmd::Import { file, prefix, dry_run, remove_source } => {
+            match transfer::import_file(&c, &transfer::ImportOpts { file, prefix, dry_run, remove_source }) {
+                Ok(v) => out(&v),
+                Err(e) => die(&e),
+            }
+        }
+        Cmd::Export { out: file, format, prefix, metadata_only } => match transfer::export(&c, &file, &format, &prefix, metadata_only) {
+            Ok(v) => out(&v),
+            Err(e) => die(&e),
+        },
         Cmd::Token { cmd } => match cmd {
             TokenCmd::Create { name, role, rules, ttl_days } => {
                 let rules: Vec<Value> = rules.iter().map(|r| parse_rule(r)).collect();
@@ -640,7 +692,7 @@ fn main() {
     }
 }
 
-fn write_private(path: &std::path::Path, data: &[u8]) {
+pub(crate) fn write_private(path: &std::path::Path, data: &[u8]) {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]

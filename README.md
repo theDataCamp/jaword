@@ -87,6 +87,25 @@ jaword run -e PGPASSWORD=infra/db/app -- psql ...    # inject into one command
 jaword audit --verify
 ```
 
+Every item has a **path** (its unique address, used by access rules and
+agents, e.g. `infra/pve/root`) plus ordinary fields: name, website, username,
+tags, notes.
+
+### Import and export
+
+```bash
+jaword import export.csv --prefix logins --dry-run   # preview
+jaword import export.csv --prefix logins --remove-source
+jaword export --out backup.csv                       # humans only, plain text
+jaword export --out inventory.csv --metadata-only    # no values, fine for agents
+```
+
+Import reads CSV exports from 1Password, Bitwarden, Chrome/Edge, Firefox,
+LastPass and KeePassXC. One-time-code (TOTP) seeds are not imported yet.
+Agents can run an import through the `secret_import_file` MCP tool: the tool
+reads the file and returns only counts and paths. A full export is plain text
+by nature, so it needs a token with `reveal`.
+
 After a reboot of the container: open the web UI and enter the passphrase, or
 run `jaword unseal`.
 
