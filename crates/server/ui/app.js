@@ -735,11 +735,22 @@ function moveDialog(d, done) {
   dlg.showModal();
 }
 
+// One job per screen: rename or move on the first, deleting on its own step.
+// Whatever the screen, its actions sit together at the bottom.
 function folderDialog(folder, done) {
+  const body = h("div", {});
   const err = h("div", { class: "error" });
+  let screen = "edit";
   const name = h("input", { type: "text", value: folder ? pretty(leafOf(folder.path)) : "", placeholder: "Personal, Work, Business…", autocomplete: "off", required: true, autofocus: true });
   const parent = folderPicker(folder ? folderOf(folder.path) : state.folder || "", { exclude: folder && folder.path, label: "Inside" });
+  const n = folder ? folder.count : 0;
+  const things = n === 1 ? "1 item" : `${n} items`;
+  const where = folder ? folderPicker(folderOf(folder.path), { exclude: folder.path, label: "Move the items to" }) : null;
+  const keep = h("input", { type: "radio", name: "what", checked: true });
+  const drop = h("input", { type: "radio", name: "what" });
+  const finish = (msg, sel) => { if (sel !== undefined) state.folder = sel; dlg.close(); toast(msg); done(); };
   const dest = () => { const leaf = slug(name.value); const dir = parent.value(); return leaf ? (dir ? dir + "/" : "") + leaf : ""; };
+
   // Tokens are limited to folders by address, and do not follow a rename.
   const warn = h("p", { class: "error", hidden: true });
   if (folder && isAdmin()) {
@@ -750,7 +761,7 @@ function folderDialog(folder, done) {
       warn.hidden = false;
     }).catch(() => { /* the warning is a courtesy */ });
   }
-  const finish = (msg, sel) => { if (sel !== undefined) state.folder = sel; dlg.close(); toast(msg); done(); };
+
   async function save(e) {
     e.preventDefault(); err.textContent = "";
     if (!parent.valid()) { err.textContent = "Give the new parent folder a name."; return; }
@@ -764,39 +775,47 @@ function folderDialog(folder, done) {
       finish("Folder updated", to);
     } catch (ex) { err.textContent = ex.status === 409 ? "Some items would collide with ones already there: " + ex.message : ex.message; }
   }
-  let removal = null;
-  if (folder) {
-    const keep = h("input", { type: "radio", name: "what", checked: true });
-    const drop = h("input", { type: "radio", name: "what" });
-    const where = folderPicker(folderOf(folder.path), { exclude: folder.path, label: "Move the items to" });
-    const n = folder.count;
-    removal = h("div", { class: "danger-zone" },
-      h("h4", {}, "Delete this folder"),
-      n === 0 ? h("p", { class: "hint" }, "This folder is empty.")
-        : h("div", {},
-            h("p", { class: "hint" }, `It contains ${n} item${n === 1 ? "" : "s"}, including any in sub-folders. What should happen to ${n === 1 ? "it" : "them"}?`),
-            h("label", { class: "check" }, keep, "Move " + (n === 1 ? "it" : "them") + " to"), where.el,
-            h("label", { class: "check" }, drop, `Delete ${n === 1 ? "it" : "all " + n} as well`)),
-      h("div", { class: "actions" }, h("button", { class: "btn danger outline", type: "button", onclick: async () => {
-        err.textContent = "";
-        const wipe = n > 0 && drop.checked;
-        if (wipe && !confirm(`Delete the folder ${folderLabel(folder.path)} and the ${n} item${n === 1 ? "" : "s"} in it?`)) return;
-        const body = { path: folder.path };
-        if (!wipe && n > 0 && !where.valid()) { err.textContent = "Give the new folder a name."; return; }
-        if (!wipe) body.move_to = n === 0 ? folderOf(folder.path) : where.value();
-        try { await api("POST", "/v1/folders/delete", body); finish(wipe ? "Folder and items deleted" : "Folder deleted", ""); }
-        catch (ex) { err.textContent = ex.status === 409 ? "The destination already has an item with the same name: " + ex.message : ex.message; }
-      } }, "Delete folder")));
+  async function remove(e) {
+    e.preventDefault(); err.textContent = "";
+    const wipe = n > 0 && drop.checked;
+    if (wipe && !confirm(`Delete the folder ${folderLabel(folder.path)} and the ${things} in it?`)) return;
+    if (!wipe && n > 0 && !where.valid()) { err.textContent = "Give the new folder a name."; return; }
+    const body = { path: folder.path };
+    if (!wipe) body.move_to = n === 0 ? folderOf(folder.path) : where.value();
+    try { await api("POST", "/v1/folders/delete", body); finish(wipe ? "Folder and items deleted" : n ? `Folder deleted, ${things} moved` : "Folder deleted", ""); }
+    catch (ex) { err.textContent = ex.status === 409 ? "The destination already has an item with the same name: " + ex.message : ex.message; }
   }
-  const dlg = dialog(null,
-    h("form", { onsubmit: save },
+  const show = (which) => { screen = which; err.textContent = ""; render(); };
+
+  function render() {
+    if (screen === "delete") {
+      const label = () => (n > 0 && drop.checked ? `Delete folder and ${things}` : "Delete folder");
+      const go = h("button", { class: "btn danger outline", type: "submit" }, label());
+      [keep, drop].forEach((r) => { r.onchange = () => { go.textContent = label(); where.el.hidden = drop.checked; }; });
+      where.el.hidden = drop.checked;
+      body.replaceChildren(h("form", { onsubmit: remove },
+        h("h3", {}, "Delete " + folderLabel(folder.path) + "?"),
+        n === 0 ? h("p", { class: "hint" }, "This folder is empty.")
+          : h("div", {},
+              h("p", {}, `It holds ${things}, counting any in sub-folders. What should happen to ${n === 1 ? "it" : "them"}?`),
+              h("label", { class: "check" }, keep, `Keep ${n === 1 ? "it" : "them"}, moved to`), h("div", { class: "indent" }, where.el),
+              h("label", { class: "check" }, drop, `Delete ${n === 1 ? "it" : "all " + n} too`)),
+        err,
+        h("div", { class: "actions" }, go, h("button", { class: "btn ghost", type: "button", onclick: () => show("edit") }, "Back"))));
+      return;
+    }
+    body.replaceChildren(h("form", { onsubmit: save },
       h("h3", {}, folder ? "Folder " + folderLabel(folder.path) : "New folder"),
       h("div", { class: "two" }, h("div", {}, h("label", {}, "Name"), name), h("div", {}, h("label", {}, "Inside"), parent.el)),
-      folder && h("p", { class: "hint" }, "Renaming or moving a folder changes the address of everything in it."),
-      warn,
-      h("div", { class: "actions" }, h("button", { class: "btn primary", type: "submit" }, folder ? "Save" : "Create folder"),
-        h("button", { class: "btn ghost", type: "button", onclick: () => dlg.close() }, "Cancel")),
-      removal, err));
+      folder && n > 0 && h("p", { class: "hint" }, `Renaming or moving it changes the address of the ${things} inside.`),
+      warn, err,
+      h("div", { class: "actions" },
+        h("button", { class: "btn primary", type: "submit" }, folder ? "Save" : "Create folder"),
+        h("button", { class: "btn ghost", type: "button", onclick: () => dlg.close() }, "Cancel"),
+        folder && h("button", { class: "link danger aside-link", type: "button", onclick: () => show("delete") }, "Delete folder…"))));
+  }
+  const dlg = dialog(null, body);
+  render();
   dlg.showModal();
 }
 

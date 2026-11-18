@@ -248,6 +248,7 @@ dialog .actions .hint { margin-left: auto; font-family: var(--mono); font-size: 
 .check input { width: auto; }
 .once { font: 14px/1.5 var(--mono); background: var(--night); border: 1px solid var(--green); border-radius: 5px; padding: 12px 14px; overflow-wrap: anywhere; margin: 12px 0; }
 textarea.code { min-height: 190px; white-space: pre; font-size: 13.5px; font-family: var(--mono); }
+.indent { margin: 6px 0 6px 27px; }
 .danger-zone { margin-top: 22px; padding-top: 4px; border-top: 1px solid var(--edge); }
 .danger-zone h4 { font-size: 15px; margin: 14px 0 6px; }
 .danger-zone select { margin: 6px 0 2px; }
