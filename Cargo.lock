@@ -678,6 +678,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "serde",
+ "serde_json",
  "sha2",
  "subtle",
  "thiserror",

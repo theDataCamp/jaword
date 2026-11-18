@@ -309,6 +309,12 @@ struct TokenReq {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RestoreReq {
+    path: String,
+    version: i64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MoveReq {
     path: String,
     new_path: String,
@@ -497,6 +503,11 @@ async fn driver(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap, Json(r): Jso
     Ok(Json(json!({"saved": true})))
 }
 
+async fn restore(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap, Json(r): Json<RestoreReq>) -> Res {
+    let a = actor(&app, &h, addr.ip())?;
+    ok(app.vault.restore_version(&a, &r.path, r.version)?)
+}
+
 async fn move_secret(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap, Json(r): Json<MoveReq>) -> Res {
     let a = actor(&app, &h, addr.ip())?;
     ok(app.vault.move_secret(&a, &r.path, &r.new_path)?)
@@ -612,6 +623,15 @@ async fn font_mono() -> Response {
     font(include_bytes!("../ui/fonts/atkinson-mono.woff2"))
 }
 
+// The word list is public data; the browser uses it to build word passwords locally.
+async fn ui_words() -> Response {
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CACHE_CONTROL, "private, max-age=604800")
+        .body(Body::from(jaword_core::generate::WORDLIST))
+        .expect("static response")
+}
+
 async fn ui_index() -> Response {
     asset("text/html; charset=utf-8", include_str!("../ui/index.html"))
 }
@@ -627,6 +647,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/", get(ui_index))
         .route("/app.js", get(ui_js))
         .route("/style.css", get(ui_css))
+        .route("/wordlist.txt", get(ui_words))
         .route("/fonts/atkinson-next.woff2", get(font_text))
         .route("/fonts/atkinson-mono.woff2", get(font_mono))
         .route("/v1/sys/status", get(status))
@@ -647,6 +668,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/secrets/delete", post(delete))
         .route("/v1/secrets/driver", post(driver))
         .route("/v1/secrets/move", post(move_secret))
+        .route("/v1/secrets/restore", post(restore))
         .route("/v1/rotation/prepare", post(rotation_prepare))
         .route("/v1/rotation/trust", post(rotation_trust))
         .route("/v1/rotation/test", post(rotation_test))

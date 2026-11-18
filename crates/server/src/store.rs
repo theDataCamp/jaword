@@ -1060,6 +1060,33 @@ impl Vault {
         r
     }
 
+    /// Make an earlier version current again, for when a new password did
+    /// not take on the real system. Recorded as a new version, so history
+    /// stays a straight line. Nothing is revealed to the caller.
+    pub fn restore_version(&self, a: &Actor, path: &str, version: i64) -> R<SecretView> {
+        let r = (|| {
+            a.require(Cap::Generate, path)?;
+            self.with_keys(|k| {
+                let mut db = self.db();
+                let tx = db.transaction()?;
+                let s = self.load(&tx, k, path)?;
+                if version == s.current_version {
+                    return bad("that version is already the current one");
+                }
+                let old = read_version(&tx, k, &s.id, version)?;
+                promote_new(&tx, k, &s.id, old.as_bytes(), &a.label())?;
+                let s = self.load(&tx, k, path)?;
+                let view = self.view(&tx, k, &s)?;
+                tx.commit()?;
+                Ok(view)
+            })
+        })();
+        let (o, d) = outcome(&r);
+        let detail = if r.is_ok() { format!("restored version {version}") } else { d };
+        self.log(&a.label(), "secret.restore", path, o, &detail)?;
+        r
+    }
+
     pub fn delete(&self, a: &Actor, path: &str) -> R<()> {
         let r = (|| {
             a.require(Cap::Delete, path)?;
@@ -1991,6 +2018,32 @@ mod tests {
         assert_eq!(v.get(&root, "a/old").unwrap().versions[0].created_by, "schedule:vault");
         v.seal(&root).unwrap();
         assert!(matches!(v.due_rotations(), Err(VErr::Sealed)));
+    }
+
+    #[test]
+    fn restore_brings_back_an_old_password_as_a_new_version() {
+        let (v, root, _) = vault();
+        let val = |s: &str| Some(Zeroizing::new(s.to_string()));
+        v.create(&root, "home/power", "password", Meta::default(), val("the-old-one"), None).unwrap();
+        v.update(&root, "home/power", None, val("the-new-one")).unwrap();
+        let s = v.restore_version(&root, "home/power", 1).unwrap();
+        assert_eq!(s.current_version, 3);
+        assert_eq!(v.reveal(&root, "home/power", None).unwrap().as_str(), "the-old-one");
+        assert_eq!(v.reveal(&root, "home/power", Some(2)).unwrap().as_str(), "the-new-one");
+        assert!(matches!(v.restore_version(&root, "home/power", 3), Err(VErr::BadRequest(_))));
+        assert!(matches!(v.restore_version(&root, "home/power", 9), Err(VErr::NotFound)));
+        // An agent may put an old version back without ever seeing it; one without the right may not.
+        let (_, t) = v.create_token(&root, "ag", Role::Agent, vec![Rule { path: "home/**".into(), caps: vec![Cap::List, Cap::Generate] }], None).unwrap();
+        let ag = v.authenticate(&t).unwrap();
+        assert_eq!(v.restore_version(&ag, "home/power", 2).unwrap().current_version, 4);
+        assert!(matches!(v.reveal(&ag, "home/power", None), Err(VErr::Forbidden)));
+        let (_, t) = v.create_token(&root, "ro", Role::Agent, vec![Rule { path: "home/**".into(), caps: vec![Cap::List] }], None).unwrap();
+        assert!(matches!(v.restore_version(&v.authenticate(&t).unwrap(), "home/power", 1), Err(VErr::Forbidden)));
+        // Word passwords are a valid stored shape and generate inside the vault.
+        let words = jaword_core::generate::Policy::Words { words: 5, separator: "-".into(), capitalize: true, number: false };
+        let g = v.generate(&root, "home/power", Some(words)).unwrap();
+        assert_eq!(v.reveal(&root, "home/power", None).unwrap().split('-').count(), 5);
+        assert!(g.meta.policy.is_some());
     }
 
     #[test]

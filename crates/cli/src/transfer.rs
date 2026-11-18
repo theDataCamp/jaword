@@ -85,6 +85,15 @@ pub fn slug(title: &str) -> String {
     if trimmed.is_empty() { "item".into() } else { trimmed }
 }
 
+/// A folder name from an export, as a path segment; empty when it has no usable characters.
+fn slug_part(name: &str) -> String {
+    if name.chars().any(|c| c.is_ascii_alphanumeric()) {
+        slug(name)
+    } else {
+        String::new()
+    }
+}
+
 fn host_of(url: &str) -> &str {
     let rest = url.split("://").nth(1).unwrap_or(url);
     rest.split(['/', '?', '#', ':']).next().unwrap_or("")
@@ -112,17 +121,29 @@ pub fn import_file(c: &Client, o: &ImportOpts) -> Result<Value, String> {
     // Column names used by 1Password, Bitwarden, Chrome/Edge, Firefox, LastPass and KeePassXC exports.
     let col_title = find_col(&header, &["title", "name", "account", "group/title"]);
     let col_url = find_col(&header, &["url", "urls", "website", "login_uri", "web site", "origin"]);
+    // NordPass has both `username` and `email`; the real username column wins.
     let col_user = find_col(&header, &["username", "login_username", "user name", "login name", "user"]);
+    let col_email = find_col(&header, &["email", "e-mail"]);
     let col_pass = find_col(&header, &["password", "login_password"]).ok_or_else(|| {
         "this CSV has no `password` column. Expected a password-manager export with columns like Title, Url, Username, Password".to_string()
     })?;
     let col_notes = find_col(&header, &["notes", "note", "extra", "notesplain", "comments"]);
-    let col_tags = find_col(&header, &["tags", "folder", "grouping", "group"]);
+    let col_tags = find_col(&header, &["tags"]);
+    let col_folder = find_col(&header, &["folder", "grouping", "group"]);
     let col_otp = find_col(&header, &["otpauth", "login_totp", "totp", "otp"]);
     let get = |row: &Vec<String>, col: Option<usize>| col.and_then(|i| row.get(i)).map(|s| s.trim().to_string()).unwrap_or_default();
 
-    let (mut imported, mut no_password, mut too_large, mut totp) = (0u32, 0u32, 0u32, 0u32);
+    let (mut imported, mut no_password, mut too_large, mut totp, mut already) = (0u32, 0u32, 0u32, 0u32, 0u32);
     let mut used: HashSet<String> = HashSet::new();
+    // What is already in the vault under this prefix: path -> (username, url).
+    let existing: std::collections::HashMap<String, (String, String)> = c
+        .list(&format!("{prefix}/"))
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(|s| (s["path"].as_str().unwrap_or("").to_string(), (s["meta"]["username"].as_str().unwrap_or("").to_string(), s["meta"]["url"].as_str().unwrap_or("").to_string())))
+        .collect();
     let mut paths: Vec<String> = Vec::new();
     let mut failed: Vec<Value> = Vec::new();
 
@@ -142,7 +163,11 @@ pub fn import_file(c: &Client, o: &ImportOpts) -> Result<Value, String> {
             totp += 1;
         }
         let name = if !title.is_empty() { title.clone() } else { host_of(&url).to_string() };
-        let base = format!("{prefix}/{}", slug(&name));
+        // A folder column in the export becomes real folders under the prefix.
+        let sub: String = get(row, col_folder).split(['/', '\\']).map(slug_part).filter(|p| !p.is_empty()).map(|p| format!("{p}/")).collect();
+        let base = format!("{prefix}/{sub}{}", slug(&name));
+        // Many sites sign in with the email address; use it when no username was saved.
+        let user_now = Some(get(row, col_user)).filter(|u| !u.is_empty()).unwrap_or_else(|| get(row, col_email)).chars().take(256).collect::<String>();
         let tags: Vec<String> = get(row, col_tags)
             .split([',', ';'])
             .map(|t| t.trim().chars().take(64).collect::<String>())
@@ -151,7 +176,7 @@ pub fn import_file(c: &Client, o: &ImportOpts) -> Result<Value, String> {
             .collect();
         let meta = json!({
             "title": title.chars().take(200).collect::<String>(),
-            "username": get(row, col_user).chars().take(256).collect::<String>(),
+            "username": user_now,
             "url": url,
             "notes": get(row, col_notes).chars().take(8000).collect::<String>(),
             "tags": tags,
@@ -161,6 +186,15 @@ pub fn import_file(c: &Client, o: &ImportOpts) -> Result<Value, String> {
         for n in 1..=50 {
             let path = if n == 1 { base.clone() } else { format!("{base}-{n}") };
             if used.contains(&path) {
+                continue;
+            }
+            if let Some((u, link)) = existing.get(&path) {
+                // Same place, same login: it was imported before. Leave it alone.
+                if *u == user_now && *link == url {
+                    already += 1;
+                    done = true;
+                    break;
+                }
                 continue;
             }
             if o.dry_run {
@@ -205,6 +239,7 @@ pub fn import_file(c: &Client, o: &ImportOpts) -> Result<Value, String> {
     Ok(json!({
         "dry_run": o.dry_run,
         "imported": imported,
+        "already_in_vault": already,
         "skipped_no_password": no_password,
         "skipped_too_large": too_large,
         "one_time_codes_not_imported": totp,

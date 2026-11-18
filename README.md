@@ -91,6 +91,23 @@ Every item has a **path** (its unique address, used by access rules and
 agents, e.g. `home-lab/proxmox-root`) plus ordinary fields: name, website, username,
 tags, notes.
 
+### Changing a password
+
+For most things (a utility company, a bank, a router) changing a password is
+something you do on the site yourself. The vault's part:
+
+1. **Change password** makes a new one: random characters, or 4 to 10 words.
+2. Look at it, adjust it, **Keep** it. Nothing changes until you do.
+3. Set it on the site. The old password stays in History.
+4. If the site did not take it, **Use again** on the old version puts it back.
+
+```bash
+jaword gen home/router --words 5        # vault-side, value not shown
+jaword restore home/router --version 2  # go back to an earlier version
+```
+
+Automatic rotation (below) is an optional extra for systems you administer.
+
 ### Folders
 
 In the web UI people work with folders (Personal, Work, Business…) and item
@@ -118,8 +135,10 @@ jaword export --out backup.csv                       # humans only, plain text
 jaword export --out inventory.csv --metadata-only    # no values, fine for agents
 ```
 
-Import reads CSV exports from 1Password, Bitwarden, Chrome/Edge, Firefox,
-LastPass and KeePassXC. One-time-code (TOTP) seeds are not imported yet.
+Import reads CSV exports from 1Password, NordPass, Bitwarden, Chrome/Edge,
+Firefox, LastPass and KeePassXC, from the web UI (**Import**), the CLI, or the
+`secret_import_file` MCP tool. Folders in the export are kept, and logins
+already in the vault are left alone, so an import can be run twice. One-time-code (TOTP) seeds are not imported yet.
 Agents can run an import through the `secret_import_file` MCP tool: the tool
 reads the file and returns only counts and paths. A full export is plain text
 by nature, so it needs a token with `reveal`.

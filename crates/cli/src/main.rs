@@ -114,6 +114,12 @@ enum Cmd {
         #[arg(long)]
         version: Option<i64>,
     },
+    /// Make an earlier version current again (when a new password did not take)
+    Restore {
+        path: String,
+        #[arg(long)]
+        version: i64,
+    },
     /// Delete a secret (soft delete)
     Rm { path: String },
     /// Move or rename a secret, e.g. `jaword mv work/vpn business/vpn`
@@ -245,6 +251,9 @@ struct PolicyArgs {
     /// Generate N random bytes as base64url
     #[arg(long, conflicts_with_all = ["length", "no_symbols"])]
     base64: Option<usize>,
+    /// Generate N random words (4-10) joined with dashes, e.g. Maple-Trumpet-Onion-Harbor-Cactus
+    #[arg(long, conflicts_with_all = ["length", "no_symbols", "hex", "base64"])]
+    words: Option<usize>,
 }
 
 impl PolicyArgs {
@@ -254,6 +263,9 @@ impl PolicyArgs {
         }
         if let Some(n) = self.base64 {
             return Some(json!({"type": "base64url", "bytes": n}));
+        }
+        if let Some(n) = self.words {
+            return Some(json!({"type": "words", "words": n, "separator": "-", "capitalize": true}));
         }
         if self.length.is_none() && !self.no_symbols {
             return None;
@@ -646,6 +658,10 @@ fn main() {
             if o.is_terminal() {
                 let _ = o.write_all(b"\n");
             }
+        }
+        Cmd::Restore { path, version } => {
+            let v = check(c.post("/v1/secrets/restore", &json!({"path": path, "version": version})));
+            println!("restored version {version} of {path} as v{}", v["current_version"]);
         }
         Cmd::Rm { path } => {
             check(c.post("/v1/secrets/delete", &json!({"path": path})));

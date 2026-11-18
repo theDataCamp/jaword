@@ -9,7 +9,7 @@ use crate::{ApiError, Client};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
-const POLICY_SCHEMA: &str = r#"{"type":"object","description":"Generation policy. One of: {\"type\":\"password\",\"length\":32,\"symbols\":\"\"(optional, empty = none)} | {\"type\":\"hex\",\"bytes\":32} | {\"type\":\"base64url\",\"bytes\":32}"}"#;
+const POLICY_SCHEMA: &str = r#"{"type":"object","description":"Generation policy. One of: {\"type\":\"password\",\"length\":32,\"symbols\":\"\"(optional, empty = none)} | {\"type\":\"hex\",\"bytes\":32} | {\"type\":\"base64url\",\"bytes\":32} | {\"type\":\"words\",\"words\":5,\"separator\":\"-\",\"capitalize\":true,\"number\":false} (4-10 random dictionary words)"}"#;
 
 fn tools() -> Value {
     let policy: Value = serde_json::from_str(POLICY_SCHEMA).unwrap_or(Value::Null);
@@ -85,6 +85,11 @@ fn tools() -> Value {
                 "format": {"type": "string", "enum": ["csv", "json"]},
                 "prefix": {"type": "string"}
             }, "required": ["out"]}
+        },
+        {
+            "name": "secret_restore",
+            "description": "Make an earlier version of a secret current again, for when a new password did not take on the real system. Recorded as a new version. The value is not returned. Version numbers come from secret_get.",
+            "inputSchema": {"type": "object", "properties": {"path": path, "version": {"type": "integer"}}, "required": ["path", "version"]}
         },
         {
             "name": "secret_move",
@@ -203,6 +208,7 @@ fn call(c: &Client, name: &str, args: &Value) -> Result<Value, ApiError> {
             true,
         )
         .map_err(|m| ApiError { status: 400, message: m }),
+        "secret_restore" => c.post("/v1/secrets/restore", &json!({"path": arg(args, "path")?, "version": args["version"].as_i64().ok_or_else(|| ApiError { status: 400, message: "missing integer argument `version`".into() })?})),
         "secret_move" => c.post("/v1/secrets/move", &json!({"path": arg(args, "path")?, "new_path": arg(args, "new_path")?})),
         "folder_list" => c.get("/v1/folders"),
         "folder_create" => c.post("/v1/folders/create", &json!({"path": arg(args, "path")?})),

@@ -207,6 +207,7 @@ function palette() {
   const commands = [
     ["New item", () => secretDialog(null, vaultReload || (() => go("secrets")))],
     ["New folder", () => folderDialog(null, vaultReload || (() => go("secrets")))],
+    ["Import from another password manager", () => importDialog(vaultReload || (() => go("secrets")))],
     ["Show passwords overdue for a change", () => { state.onlyStale = true; state.folder = ""; go("secrets"); }],
     ["Go to Vault", () => go("secrets")],
   ];
@@ -343,7 +344,8 @@ async function viewSecrets(main) {
     else rows = [...rows].sort((a, b) => itemName(a).localeCompare(itemName(b)));
     const sorter = (key, label) => h("button", { class: state.sort === key ? "on" : null, title: "Sort by " + label.toLowerCase(), onclick: () => { state.sort = key; renderTable(); } }, label);
     const newBtn = h("button", { class: "btn primary small", onclick: () => secretDialog(null, reload) }, "New item");
-    const title = h("div", { class: "tablehead" }, h("div", { class: "cap grow" }, state.onlyStale ? "Overdue for a change" : state.folder ? folderLabel(state.folder) : "All items"), newBtn);
+    const title = h("div", { class: "tablehead" }, h("div", { class: "cap grow" }, state.onlyStale ? "Overdue for a change" : state.folder ? folderLabel(state.folder) : "All items"),
+      h("button", { class: "btn small", onclick: () => importDialog(reload) }, "Import"), newBtn);
     title.style.marginBottom = "6px";
     if (!rows.length) {
       if (state.secrets.length) return tableEl.replaceChildren(title, h("div", { class: "empty" }, state.onlyStale ? "Nothing is overdue." : "This folder is empty."));
@@ -351,7 +353,7 @@ async function viewSecrets(main) {
       const have = new Set(state.folders.map((f) => f.path));
       const ideas = ["Personal", "Work", "Family"].filter((n) => !have.has(slug(n)));
       return tableEl.replaceChildren(title, h("div", { class: "empty" },
-        h("p", {}, "The vault is empty. Add an item, or bring everything over from another password manager with jaword import."),
+        h("p", {}, "The vault is empty. Add an item, or use Import to bring everything over from another password manager."),
         ideas.length > 0 && h("div", { class: "row" }, h("span", {}, "Start with a folder:"), ideas.map(starter), h("button", { class: "link", onclick: () => folderDialog(null, reload) }, "or name your own"))));
     }
     tableEl.replaceChildren(title, h("table", { class: "grid" },
@@ -446,6 +448,7 @@ function secretPanel(d, reload) {
       rotates(d) && h("dt", {}, "Rotation"), rotates(d) && h("dd", {}, drv)),
     h("div", { class: "row" },
       d.has_driver && h("button", { class: "btn go", onclick: () => confirm(`Rotate ${itemName(d)} on the live system now?`) && act("/v1/secrets/rotate", { path: d.path }, "Rotated") }, "Rotate now"),
+      h("button", { class: "btn" + (d.has_driver ? "" : " primary"), onclick: () => changeDialog(d, reload) }, rotates(d) && d.kind !== "ssh_key" ? "Change password" : "Replace"),
       h("button", { class: "btn", onclick: () => secretDialog(d, reload) }, "Edit"),
       h("button", { class: "btn", onclick: () => moveDialog(d, reload) }, "Move"),
       isAdmin() && rotates(d) && h("button", { class: "btn", onclick: () => rotationDialog(d, reload) }, d.has_driver ? "Rotation setup" : "Set up rotation"),
@@ -454,7 +457,9 @@ function secretPanel(d, reload) {
     h("div", { class: "cap sep" }, "History"),
     h("ul", { class: "timeline" }, d.versions.map((v) => h("li", { class: v.state, title: v.state },
       h("span", { class: "v" }, "v" + v.version), h("span", {}, short(v.created_at)), h("span", {}, who(v.created_by)),
-      v.state !== "current" && h("button", { class: "link", onclick: () => reveal(v.version) }, v.state === "failed" ? "Show (failed)" : "Show")))),
+      v.state !== "current" && h("span", { class: "acts" },
+        h("button", { class: "link", onclick: () => reveal(v.version) }, "Show"),
+        v.state !== "pending" && h("button", { class: "link", title: "Make this version the current one again", onclick: () => confirm(`Go back to version ${v.version}? It becomes the current password again; nothing is lost.`) && act("/v1/secrets/restore", { path: d.path, version: v.version }, `Version ${v.version} is current again`) }, "Use again"))))),
     h("div", { class: "row end" }, h("button", { class: "link danger", onclick: () => confirm(`Delete ${itemName(d)}?`) && act("/v1/secrets/delete", { path: d.path }, "Deleted") }, "Delete")));
 }
 
@@ -484,58 +489,106 @@ function makePassword(o) {
   return out.join("");
 }
 
+// Word passwords use the EFF list (7,776 words), fetched once from the vault.
+let WORDS = null;
+async function loadWords() {
+  if (!WORDS) WORDS = (await (await fetch("/wordlist.txt", { credentials: "omit" })).text()).split("\n").filter(Boolean);
+  return WORDS;
+}
+const WORDS_MIN = 4, WORDS_MAX = 10;
+const SEPARATORS = [["-", "dashes"], ["", "run together"], [".", "dots"], [" ", "spaces"]];
+
+function makeWords(o) {
+  const digitAt = o.number ? randInt(o.words) : -1;
+  return Array.from({ length: o.words }, (_, i) => {
+    let w = WORDS[randInt(WORDS.length)];
+    if (o.capitalize) w = w[0].toUpperCase() + w.slice(1);
+    return i === digitAt ? w + randInt(10) : w;
+  }).join(o.separator);
+}
+
 function generator(policy) {
-  const o = { length: 24, lower: true, upper: true, digits: true, symbols: true, plain: false };
+  const o = { mode: "random", length: 24, lower: true, upper: true, digits: true, symbols: true, plain: false, words: 5, separator: "-", capitalize: true, number: false };
   if (policy && policy.type === "password") Object.assign(o, { length: Math.max(LEN_MIN, Math.min(LEN_MAX, policy.length || 24)), lower: policy.lower !== false, upper: policy.upper !== false, digits: policy.digits !== false, symbols: policy.symbols !== "", plain: !!policy.exclude_ambiguous });
+  if (policy && policy.type === "words") Object.assign(o, { mode: "words", words: Math.max(WORDS_MIN, Math.min(WORDS_MAX, policy.words || 5)), separator: policy.separator == null ? "-" : policy.separator, capitalize: policy.capitalize !== false, number: !!policy.number });
   let typed = false;
   const field = h("input", { class: "pw", type: "text", autocomplete: "off", autocapitalize: "off", spellcheck: "false", "aria-label": "Password. Type here to use your own" });
-  // The length slider is a runway: lights come on up to the chosen length.
-  const range = h("input", { type: "range", min: String(LEN_MIN), max: String(LEN_MAX), step: "1", value: String(o.length), "aria-label": "Password length" });
-  const dots = Array.from({ length: LIGHTS }, () => h("i", {}));
-  const strip = h("div", { class: "strip" }, dots, range);
   const verdict = h("div", { class: "verdict" });
-  const chip = (key, label, title) => {
-    const box = h("input", { type: "checkbox", checked: o[key], "aria-label": title });
-    box.addEventListener("change", () => {
-      o[key] = box.checked;
-      if (!poolFor(o).length) { o[key] = true; box.checked = true; return; }   // keep at least one set
-      roll();
-    });
-    return h("label", { class: "chip", title }, box, h("span", {}, label));
-  };
+  const modes = h("div", { class: "segs" });
+  const runway = h("div", { class: "runway" });
+  const opts = h("div", { class: "opts" });
+  let range, dots;
+  const words = () => o.mode === "words";
+
   function meter() {
     const v = field.value;
     let bits;
     if (typed) {
       const pool = (/[a-z]/.test(v) ? 26 : 0) + (/[A-Z]/.test(v) ? 26 : 0) + (/[0-9]/.test(v) ? 10 : 0) + (/[^A-Za-z0-9]/.test(v) ? 20 : 0);
       bits = v.length * Math.log2(pool || 1);
-    } else bits = o.length * Math.log2(poolFor(o).flat().length);
-    const grade = bits < 60 ? "weak" : bits < 90 ? "fair" : "";
+    } else if (words()) bits = o.words * Math.log2(7776) + (o.number ? Math.log2(10 * o.words) : 0);
+    else bits = o.length * Math.log2(poolFor(o).flat().length);
+    const grade = bits < 50 ? "weak" : bits < 75 ? "fair" : "";
+    const word = grade === "weak" ? "Weak" : grade === "fair" ? "Good" : "Strong";
     verdict.className = "verdict " + grade;
     verdict.textContent = typed
       ? `Typed by hand, ${v.length} characters. ${grade === "weak" ? "Too easy to guess." : grade === "fair" ? "Acceptable." : "Strong, if it is not reused or a phrase."}`
-      : `${o.length} characters. ${grade === "weak" ? "Weak" : grade === "fair" ? "Good" : "Strong"}, about ${Math.round(bits)} bits.`;
-    const len = typed ? Math.max(LEN_MIN, Math.min(LEN_MAX, v.length)) : o.length;
-    const lit = Math.round(((len - LEN_MIN) / (LEN_MAX - LEN_MIN)) * (LIGHTS - 1));
+      : words() ? `${o.words} words, ${v.length} characters. ${word}, about ${Math.round(bits)} bits.`
+      : `${o.length} characters. ${word}, about ${Math.round(bits)} bits.`;
+    // Long word passwords shrink to stay readable on one line.
+    field.style.fontSize = v.length > 46 ? "13px" : v.length > 36 ? "15px" : v.length > 27 ? "18px" : "";
+    const [lo, hi, val] = words() ? [WORDS_MIN, WORDS_MAX, o.words] : [LEN_MIN, LEN_MAX, typed ? Math.max(LEN_MIN, Math.min(LEN_MAX, v.length)) : o.length];
+    const lit = Math.round(((val - lo) / (hi - lo)) * (dots.length - 1));
     dots.forEach((dEl, i) => { dEl.className = i === lit ? "lit knob" : i < lit ? "lit" : ""; });
   }
-  function roll() { typed = false; field.value = makePassword(o); range.value = String(o.length); meter(); }
-  range.addEventListener("input", () => { o.length = Number(range.value); roll(); });
+  function roll() {
+    typed = false;
+    if (words() && !WORDS) { field.value = ""; field.placeholder = "Loading words…"; loadWords().then(roll, () => { field.placeholder = "Could not load the word list"; }); return; }
+    field.value = words() ? makeWords(o) : makePassword(o);
+    range.value = String(words() ? o.words : o.length);
+    meter();
+  }
+  const toggle = (key, label, title, guard) => {
+    const box = h("input", { type: "checkbox", checked: o[key], "aria-label": title });
+    box.addEventListener("change", () => { o[key] = box.checked; if (guard && !guard()) { o[key] = true; box.checked = true; return; } roll(); });
+    return h("label", { class: "chip", title }, box, h("span", {}, label));
+  };
+  // The slider is a runway: lights come on up to the chosen length.
+  function build() {
+    const [lo, hi, val, count] = words() ? [WORDS_MIN, WORDS_MAX, o.words, WORDS_MAX - WORDS_MIN + 1] : [LEN_MIN, LEN_MAX, o.length, LIGHTS];
+    range = h("input", { type: "range", min: String(lo), max: String(hi), step: "1", value: String(val), "aria-label": words() ? "Number of words" : "Password length" });
+    range.addEventListener("input", () => { if (words()) o.words = Number(range.value); else o.length = Number(range.value); roll(); });
+    dots = Array.from({ length: count }, () => h("i", {}));
+    runway.replaceChildren(h("span", {}, lo), h("div", { class: "strip" }, dots, range), h("span", {}, hi));
+    modes.replaceChildren(...[["random", "Random characters"], ["words", "Words"]].map(([m, label]) =>
+      h("button", { class: "seg" + (o.mode === m ? " on" : ""), type: "button", "aria-pressed": o.mode === m ? "true" : "false", onclick: () => { if (o.mode !== m) { o.mode = m; build(); roll(); } } }, label)));
+    if (words()) {
+      const seps = SEPARATORS.map(([v, label]) => {
+        const radio = h("input", { type: "radio", name: "gen-sep", checked: o.separator === v, "aria-label": "Between words: " + label });
+        radio.addEventListener("change", () => { o.separator = v; roll(); });
+        return h("label", { class: "chip", title: "Between words: " + label }, radio, h("span", {}, label));
+      });
+      opts.replaceChildren(...seps, toggle("capitalize", "Capitals", "Start each word with a capital letter"), toggle("number", "a number", "Add one digit, for sites that insist on a number"));
+    } else {
+      const keepOne = () => poolFor(o).length > 0;
+      opts.replaceChildren(toggle("lower", "a-z", "Lowercase letters", keepOne), toggle("upper", "A-Z", "Capital letters", keepOne), toggle("digits", "0-9", "Digits", keepOne), toggle("symbols", "!@#", "Symbols", keepOne), toggle("plain", "no l1O0", "Leave out characters that look alike", keepOne));
+    }
+  }
   field.addEventListener("input", () => { typed = true; meter(); });
   const el = h("div", { class: "gen" },
-    field,
-    h("div", { class: "runway" }, h("span", {}, LEN_MIN), strip, h("span", {}, LEN_MAX)),
-    verdict,
-    h("div", { class: "opts" }, chip("lower", "a-z", "Lowercase letters"), chip("upper", "A-Z", "Capital letters"), chip("digits", "0-9", "Digits"), chip("symbols", "!@#", "Symbols"), chip("plain", "no l1O0", "Leave out characters that look alike")),
+    modes, field, runway, verdict, opts,
     h("div", { class: "foot" }, h("span", { class: "hint" }, "Or type your own above"),
       h("button", { class: "link", type: "button", onclick: roll }, "Regenerate"),
       h("button", { class: "link", type: "button", onclick: async () => { try { await navigator.clipboard.writeText(field.value); toast("Copied"); } catch (_) { toast("Copy failed, select it by hand", true); } } }, "Copy")));
+  build();
   roll();
   return {
     el,
     value: () => field.value,
-    // Remembered so rotations keep the same shape; null when typed by hand.
-    policy: () => (typed ? null : { type: "password", length: o.length, lower: o.lower, upper: o.upper, digits: o.digits, symbols: o.symbols ? null : "", exclude_ambiguous: o.plain }),
+    // Remembered so the next change starts from the same shape; null when typed by hand.
+    policy: () => (typed ? null
+      : words() ? { type: "words", words: o.words, separator: o.separator, capitalize: o.capitalize, number: o.number }
+      : { type: "password", length: o.length, lower: o.lower, upper: o.upper, digits: o.digits, symbols: o.symbols ? null : "", exclude_ambiguous: o.plain }),
   };
 }
 
@@ -565,9 +618,8 @@ function secretDialog(existing, done) {
   const where = h("span", { class: "hint" });
   const genRow = h("div", {}, gen.el);
   const contentRow = h("div", { hidden: true }, h("label", {}, "Content"), f.content);
-  // When editing, the secret itself only changes if the person asks for that.
-  let replacing = !existing;
-  const replaceBtn = h("button", { class: "btn", type: "button", onclick: () => { replacing = true; sync(); } }, "Change the password");
+  // Editing changes details only; the password has its own Change password dialog.
+  const replacing = !existing;
   const generated = () => ["password", "api_key"].includes(existing ? existing.kind : f.kind.value);
   const target = () => {
     const dir = folder.value();
@@ -576,7 +628,6 @@ function secretDialog(existing, done) {
   const sync = () => {
     genRow.hidden = !replacing || !generated();
     contentRow.hidden = !replacing || generated();
-    replaceBtn.hidden = replacing;
     if (!existing) where.textContent = "Agents will know it as " + target();
   };
   [f.title, folder.el].forEach((el) => el.addEventListener("input", sync));
@@ -612,11 +663,54 @@ function secretDialog(existing, done) {
       h("div", { class: "stack" }, f.tags, f.notes),
       err,
       h("div", { class: "actions" }, h("button", { class: "btn primary", type: "submit" }, existing ? "Save changes" : "Add to vault"),
-        existing && replaceBtn,
         h("button", { class: "btn ghost", type: "button", onclick: () => dlg.close() }, "Cancel"),
         h("span", { class: "hint" }, SAVE_HINT))));
   quickSave(dlg);
   sync();
+  dlg.showModal();
+}
+
+// Make a new password, look at it, decide to keep it. The old one stays in
+// History in case the real system did not accept the new one.
+function changeDialog(d, done) {
+  const made = ["password", "api_key"].includes(d.kind);
+  const gen = made ? generator(d.meta.policy) : null;
+  const content = h("textarea", { class: "mono", spellcheck: "false", placeholder: "Paste the new content", autofocus: true });
+  const err = h("div", { class: "error" });
+  async function keep(copy) {
+    err.textContent = "";
+    const value = made ? gen.value() : content.value;
+    if (!value) { err.textContent = made ? "The password is empty." : "Add the new content."; return; }
+    const body = { path: d.path, value };
+    const pol = made ? gen.policy() : null;
+    if (pol) body.meta = Object.assign({}, d.meta, { policy: pol });
+    try {
+      await api("POST", "/v1/secrets/update", body);
+      let copied = false;
+      if (copy) { try { await navigator.clipboard.writeText(value); copied = true; } catch (_) { /* clipboard blocked */ } }
+      dlg.close();
+      toast(copied ? "Kept and copied. The old one is in History if you need it back" : "Kept. The old one is in History if you need it back");
+      done();
+    } catch (ex) {
+      if (ex.status === 401 || ex.code === "sealed") { dlg.close(); return fail(ex); }
+      err.textContent = ex.status === 403 ? "This access token may not set passwords by hand. Ask an admin for the write permission." : ex.message;
+    }
+  }
+  const dlg = dialog(null,
+    h("form", { onsubmit: (e) => { e.preventDefault(); keep(true); } },
+      h("div", { class: "title" }, h("h3", {}, made ? "New password for " + itemName(d) : "Replace " + itemName(d))),
+      made ? gen.el : content,
+      h("p", { class: "hint" }, made
+        ? "Nothing changes until you keep it. Then set it on the site or device yourself; the current password stays in History in case the new one does not take."
+        : "The current content stays in History."),
+      d.has_driver && h("p", { class: "hint" }, "This item also has automatic rotation set up. Changing it here does not change it on the server; use Rotate now for that."),
+      err,
+      h("div", { class: "actions" },
+        h("button", { class: "btn primary", type: "submit" }, made ? "Keep and copy" : "Keep"),
+        made && h("button", { class: "btn", type: "button", onclick: () => keep(false) }, "Keep"),
+        h("button", { class: "btn ghost", type: "button", onclick: () => dlg.close() }, "Discard"),
+        h("span", { class: "hint" }, SAVE_HINT))));
+  quickSave(dlg);
   dlg.showModal();
 }
 
@@ -870,6 +964,167 @@ function rotationDialog(d, done) {
     const first = body.querySelector("[autofocus]"); if (first && document.activeElement === document.body) first.focus();
   }
   const dlg = dialog("wide", body);
+  render();
+  dlg.showModal();
+}
+
+// ---- import from another password manager -------------------------------
+// The export file is read here in the browser and each login is added
+// through the normal API. The file itself is never uploaded or stored.
+
+function parseCsv(text) {
+  const rows = []; let row = [], field = "", quoted = false;
+  text = text.replace(/^\uFEFF/, "");
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"' && text[i + 1] === '"') { field += '"'; i++; }
+      else if (c === '"') quoted = false;
+      else field += c;
+    } else if (c === '"' && field === "") quoted = true;
+    else if (c === ",") { row.push(field); field = ""; }
+    else if (c === "\r" && text[i + 1] === "\n") { /* handled by the newline */ }
+    else if (c === "\n" || c === "\r") { row.push(field); field = ""; rows.push(row); row = []; }
+    else field += c;
+  }
+  if (field !== "" || row.length) { row.push(field); rows.push(row); }
+  return rows.filter((r) => r.some((f) => f.trim() !== ""));
+}
+
+const IMPORT_COLUMNS = {
+  title: ["title", "name", "account", "group/title"],
+  url: ["url", "urls", "website", "login_uri", "web site", "origin"],
+  username: ["username", "login_username", "user name", "login name", "user"],
+  email: ["email", "e-mail"],
+  password: ["password", "login_password"],
+  notes: ["notes", "note", "extra", "notesplain", "comments"],
+  tags: ["tags"],
+  folder: ["folder", "grouping", "group"],
+  otp: ["otpauth", "login_totp", "totp", "otp"],
+};
+
+// Turn an export into plain rows. Throws with a message a person can act on.
+function readExport(text) {
+  const rows = parseCsv(text);
+  if (rows.length < 2) throw new Error("That file has no rows. Export as CSV from your password manager and choose that file.");
+  const header = rows.shift().map((x) => x.trim().toLowerCase());
+  const col = {};
+  for (const [k, names] of Object.entries(IMPORT_COLUMNS)) col[k] = header.findIndex((x) => names.includes(x));
+  if (col.password < 0) throw new Error("That file has no password column. It should be a CSV export with columns like name, url, username, password.");
+  const from = header.includes("cardholdername") ? "NordPass" : header.includes("otpauth") || header.includes("archived") ? "1Password" : header.includes("login_uri") ? "Bitwarden" : header.includes("grouping") ? "LastPass" : header.includes("timepasswordchanged") ? "Firefox" : "your password manager";
+  const get = (r, k) => (col[k] >= 0 && r[col[k]] != null ? r[col[k]].trim() : "");
+  const out = { from, items: [], noPassword: 0, codes: 0, tooLong: 0, hasFolders: false };
+  for (const r of rows) {
+    const password = col.password >= 0 && r[col.password] != null ? r[col.password] : "";
+    if (!password) { out.noPassword++; continue; }
+    if (password.length > 16000) { out.tooLong++; continue; }
+    if (get(r, "otp")) out.codes++;
+    const folder = get(r, "folder");
+    if (folder) out.hasFolders = true;
+    out.items.push({
+      title: get(r, "title").slice(0, 200), url: get(r, "url").split(/[,\n]/)[0].trim().slice(0, 2048), username: (get(r, "username") || get(r, "email")).slice(0, 256),
+      password, notes: get(r, "notes").slice(0, 8000), folder,
+      tags: get(r, "tags").split(/[,;]/).map((t) => t.trim().slice(0, 64)).filter(Boolean).slice(0, 32),
+    });
+  }
+  return out;
+}
+
+const hostOf = (url) => (url.split("://")[1] || url).split(/[/?#:]/)[0];
+
+// Add the rows to the vault. Items already there (same place, same username
+// and site) are left alone; name clashes with different logins get a suffix.
+async function runImport(items, dest, keepFolders, onProgress) {
+  const known = new Map(state.secrets.map((x) => [x.path, x]));
+  const res = { added: 0, already: 0, failed: [] };
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    onProgress(i, items.length);
+    const sub = keepFolders && it.folder ? it.folder.split(/[/\\]/).map(slug).filter(Boolean) : [];
+    const base = [dest, ...sub, slug(it.title || hostOf(it.url)) || "item"].filter(Boolean).join("/");
+    const meta = { title: it.title, username: it.username, url: it.url, notes: it.notes, tags: it.tags };
+    let done = false;
+    for (let n = 1; n <= 30 && !done; n++) {
+      const path = n === 1 ? base : `${base}-${n}`;
+      const have = known.get(path);
+      if (have) {
+        if (have.meta.username === it.username && have.meta.url === it.url) { res.already++; done = true; }
+        continue;
+      }
+      try {
+        const made = await api("POST", "/v1/secrets/create", { path, kind: "password", meta, value: it.password });
+        known.set(path, made); res.added++; done = true;
+      } catch (e) {
+        if (e.status === 409) { known.set(path, { meta: {} }); continue; }
+        if (e.status === 401 || e.status === 403 || e.code === "sealed") { e.partial = res; throw e; }
+        res.failed.push(`${it.title || path}: ${e.message}`); done = true;
+      }
+    }
+    if (!done) res.failed.push(`${it.title || base}: no free name`);
+  }
+  onProgress(items.length, items.length);
+  return res;
+}
+
+function importDialog(done) {
+  const body = h("div", {});
+  let data = null, busy = false;
+  const dest = folderPicker(state.folder || "", { label: "Put them in" });
+  const keepFolders = h("input", { type: "checkbox", checked: true });
+  const file = h("input", { type: "file", accept: ".csv,text/csv", "aria-label": "Export file" });
+  const err = h("div", { class: "error" });
+  file.addEventListener("change", async () => {
+    err.textContent = ""; data = null;
+    const f = file.files && file.files[0];
+    if (!f) return render();
+    if (f.size > 20 * 1024 * 1024) { err.textContent = "That file is larger than 20 MB."; return render(); }
+    try { data = readExport(await f.text()); } catch (e) { err.textContent = e.message; }
+    render();
+  });
+  function render(result, progress) {
+    const n = data ? data.items.length : 0;
+    body.replaceChildren(h("div", {},
+      h("h3", {}, "Import from another password manager"),
+      result ? [
+        h("p", {}, h("span", { class: "st" }, lamp(result.failed.length ? "amber" : "green"), `${result.added} added.`), result.already > 0 && ` ${result.already} were already in the vault and left alone.`),
+        result.failed.length > 0 && h("pre", { class: "details" }, result.failed.slice(0, 50).join("\n")),
+        h("p", { class: "error" }, "Now delete the export file from your computer and empty the trash. It holds every one of those passwords in plain text."),
+        h("div", { class: "actions" }, h("button", { class: "btn primary", type: "button", onclick: () => dlg.close() }, "Done")),
+      ] : [
+        h("p", { class: "hint" }, "Export your logins as a CSV file from 1Password, NordPass, Bitwarden, LastPass, KeePassXC, Chrome, Edge or Firefox, then choose that file. It is read here in your browser and never uploaded as a file."),
+        file,
+        data && h("div", {},
+          h("p", {}, h("span", { class: "st" }, lamp("green"), `${n} ${n === 1 ? "login" : "logins"} found, from ${data.from}.`)),
+          (data.noPassword > 0 || data.codes > 0 || data.tooLong > 0) && h("p", { class: "hint" },
+            [data.noPassword > 0 && `${data.noPassword} without a password (notes, cards, identities) will be skipped.`, data.codes > 0 && `${data.codes} have one-time codes; the logins are imported, the codes are not.`, data.tooLong > 0 && `${data.tooLong} are too large and will be skipped.`].filter(Boolean).join(" ")),
+          h("label", {}, "Put them in"), dest.el,
+          data.hasFolders && h("label", { class: "check" }, keepFolders, "Keep the folders from the file, inside that one")),
+        progress && h("p", { class: "st" }, lamp("amber"), progress),
+        err,
+        h("div", { class: "actions" },
+          h("button", { class: "btn primary", type: "button", disabled: !n || busy, onclick: go }, busy ? "Importing…" : n ? `Import ${n} ${n === 1 ? "login" : "logins"}` : "Import"),
+          h("button", { class: "btn ghost", type: "button", disabled: busy, onclick: () => dlg.close() }, "Cancel")),
+      ]));
+  }
+  async function go() {
+    if (busy || !data) return;
+    err.textContent = "";
+    let where;
+    try { where = await dest.ensure(); } catch (e) { err.textContent = e.message; return; }
+    busy = true; render(null, "Starting…");
+    try {
+      const res = await runImport(data.items, where, keepFolders.checked, (i, n) => { const p = body.querySelector("p.st"); if (p) p.lastChild.textContent = `Importing ${Math.min(i + 1, n)} of ${n}…`; });
+      busy = false; data = null; render(res); done();
+    } catch (e) {
+      busy = false;
+      if (e.status === 401 || e.code === "sealed") { dlg.close(); return fail(e); }
+      const part = e.partial ? ` ${e.partial.added} were added before it stopped.` : "";
+      err.textContent = (e.status === 403 ? "This access token may not add passwords here. It needs Add items and Set passwords by hand on that folder." : e.message) + part;
+      render(); done();
+    }
+  }
+  const dlg = dialog(null, body);
+  dlg.addEventListener("cancel", (e) => { if (busy) e.preventDefault(); });
   render();
   dlg.showModal();
 }
