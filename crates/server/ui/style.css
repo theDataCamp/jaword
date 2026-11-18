@@ -204,6 +204,7 @@ kbd { font: 500 12.5px var(--mono); color: var(--mute); background: var(--lit); 
 .chip input { position: absolute; opacity: 0; pointer-events: none; }
 .chip span { display: flex; align-items: center; gap: 8px; padding: 4px 12px 4px 10px; border-radius: 5px; border: 1px solid var(--edge); color: var(--mute); font: 500 13.5px var(--mono); }
 .chip span::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--edge); }
+.opts.plain .chip span { font-family: var(--sans); font-size: 14px; }
 .chip input:checked + span { background: var(--lit); border-color: var(--lit); color: var(--text); }
 .chip input:checked + span::before { background: var(--green); }
 .chip input:focus-visible + span { outline: 2px solid var(--blue); outline-offset: 2px; }

@@ -75,7 +75,7 @@ const who = (actor) => (actor || "").split(":")[0] || "unknown";
 const pretty = (seg) => { const t = seg.replace(/[-_]+/g, " "); return t.charAt(0).toUpperCase() + t.slice(1); };
 const folderOf = (p) => { const i = p.lastIndexOf("/"); return i < 0 ? "" : p.slice(0, i); };
 const leafOf = (p) => p.slice(p.lastIndexOf("/") + 1);
-const folderLabel = (p) => (p ? p.split("/").map(pretty).join(" / ") : "No folder");
+const folderLabel = (p) => (p ? p.split("/").map(pretty).join(" / ") : "Vault");
 const slug = (t) => t.toLowerCase().normalize("NFKD").replace(/[^a-z0-9._-]+/g, "-").replace(/\.{2,}/g, ".").replace(/^[^a-z0-9]+|[-.]+$/g, "").slice(0, 60);
 const itemName = (s) => s.meta.title || pretty(leafOf(s.path));
 
@@ -245,13 +245,36 @@ document.addEventListener("keydown", (e) => {
 
 // ------------------------------------------------------------------ vault
 
-function folderSelect(selected, opts) {
+// A folder dropdown that can also make a new folder on the spot. The top
+// level is called the Vault; folders are created inside it.
+const NEW_FOLDER = "\u0000new";
+function folderPicker(selected, opts) {
   const o = opts || {};
   const list = (state.folders || []).filter((f) => !o.exclude || (f.path !== o.exclude && !f.path.startsWith(o.exclude + "/")));
-  return h("select", {},
-    h("option", { value: "", selected: selected === "" }, o.rootLabel || "No folder"),
+  const sel = h("select", { "aria-label": o.label || "Folder" },
+    (o.extra || []).map(([v, l]) => h("option", { value: v, selected: v === selected }, l)),
+    !o.noRoot && h("option", { value: "", selected: selected === "" }, "Vault (no folder)"),
     list.map((f) => h("option", { value: f.path, selected: f.path === selected }, "  ".repeat(f.path.split("/").length - 1) + pretty(leafOf(f.path)))),
-    o.allowNew && h("option", { value: "\u0000new" }, "+ New folder…"));
+    h("option", { value: NEW_FOLDER }, "+ New folder…"),
+    (o.tail || []).map(([v, l]) => h("option", { value: v }, l)));
+  const name = h("input", { type: "text", placeholder: "Name of the new folder", autocomplete: "off", hidden: true, "aria-label": "Name of the new folder" });
+  name.style.marginTop = "8px";
+  sel.addEventListener("change", () => { name.hidden = sel.value !== NEW_FOLDER; if (!name.hidden) name.focus(); });
+  return {
+    el: h("div", {}, sel, name),
+    raw: () => sel.value,
+    isNew: () => sel.value === NEW_FOLDER,
+    valid: () => sel.value !== NEW_FOLDER || !!slug(name.value),
+    value: () => (sel.value === NEW_FOLDER ? slug(name.value) : sel.value),
+    // Make sure a newly named folder exists, then return its path.
+    async ensure() {
+      if (sel.value !== NEW_FOLDER) return sel.value;
+      const p = slug(name.value);
+      if (!p) throw new Error("Give the new folder a name.");
+      await api("POST", "/v1/folders/create", { path: p });
+      return p;
+    },
+  };
 }
 
 function ageCell(s) {
@@ -323,7 +346,13 @@ async function viewSecrets(main) {
     const title = h("div", { class: "tablehead" }, h("div", { class: "cap grow" }, state.onlyStale ? "Overdue for a change" : state.folder ? folderLabel(state.folder) : "All items"), newBtn);
     title.style.marginBottom = "6px";
     if (!rows.length) {
-      return tableEl.replaceChildren(title, h("div", { class: "empty" }, state.secrets.length ? (state.onlyStale ? "Nothing is overdue." : "This folder is empty.") : "The vault is empty. Add an item, or import from another password manager with `jaword import`."));
+      if (state.secrets.length) return tableEl.replaceChildren(title, h("div", { class: "empty" }, state.onlyStale ? "Nothing is overdue." : "This folder is empty."));
+      const starter = (n) => h("button", { class: "btn small", onclick: async () => { try { await api("POST", "/v1/folders/create", { path: slug(n) }); reload(); } catch (e) { fail(e); } } }, n);
+      const have = new Set(state.folders.map((f) => f.path));
+      const ideas = ["Personal", "Work", "Family"].filter((n) => !have.has(slug(n)));
+      return tableEl.replaceChildren(title, h("div", { class: "empty" },
+        h("p", {}, "The vault is empty. Add an item, or bring everything over from another password manager with jaword import."),
+        ideas.length > 0 && h("div", { class: "row" }, h("span", {}, "Start with a folder:"), ideas.map(starter), h("button", { class: "link", onclick: () => folderDialog(null, reload) }, "or name your own"))));
     }
     tableEl.replaceChildren(title, h("table", { class: "grid" },
       h("thead", {}, h("tr", {}, h("th", {}, sorter("name", "Name")), h("th", { class: "us" }, "Username"), h("th", {}, sorter("age", "Last changed")), h("th", {}, "Rotation"), h("th", { class: "ver" }, "Ver"))),
@@ -523,8 +552,6 @@ function secretDialog(existing, done) {
   const kinds = [["password", "Login or password"], ["api_key", "API key"], ["ssh_key", "SSH key"], ["config", "Configuration"], ["note", "Secure note"]];
   const f = {
     title: h("input", { class: "big", type: "text", placeholder: "Name, like GitHub or Proxmox root", value: m.title || "", autocomplete: "off", maxlength: "200", autofocus: true, required: !existing, "aria-label": "Name" }),
-    folder: folderSelect(state.folder || "", { allowNew: true }),
-    newFolder: h("input", { type: "text", placeholder: "Name of the new folder", autocomplete: "off" }),
     kind: h("select", {}, kinds.map(([k, l]) => h("option", { value: k }, l))),
     username: h("input", { type: "text", value: m.username, autocomplete: "off", placeholder: "Username", "aria-label": "Username" }),
     url: h("input", { type: "text", value: m.url, placeholder: "Website", autocomplete: "off", "aria-label": "Website" }),
@@ -533,9 +560,9 @@ function secretDialog(existing, done) {
     content: h("textarea", { class: "mono", spellcheck: "false", placeholder: "Paste the key or text to keep safe" }),
   };
   const gen = generator(existing && existing.meta.policy);
+  const folder = folderPicker(state.folder || "");
   const err = h("div", { class: "error" });
   const where = h("span", { class: "hint" });
-  const newFolderRow = h("div", { hidden: true }, h("label", {}, "New folder"), f.newFolder);
   const genRow = h("div", {}, gen.el);
   const contentRow = h("div", { hidden: true }, h("label", {}, "Content"), f.content);
   // When editing, the secret itself only changes if the person asks for that.
@@ -543,18 +570,17 @@ function secretDialog(existing, done) {
   const replaceBtn = h("button", { class: "btn", type: "button", onclick: () => { replacing = true; sync(); } }, "Change the password");
   const generated = () => ["password", "api_key"].includes(existing ? existing.kind : f.kind.value);
   const target = () => {
-    const folder = f.folder.value === "\u0000new" ? slug(f.newFolder.value) : f.folder.value;
-    return (folder ? folder + "/" : "") + (slug(f.title.value) || "item");
+    const dir = folder.value();
+    return (dir ? dir + "/" : "") + (slug(f.title.value) || "item");
   };
   const sync = () => {
-    newFolderRow.hidden = f.folder.value !== "\u0000new";
     genRow.hidden = !replacing || !generated();
     contentRow.hidden = !replacing || generated();
     replaceBtn.hidden = replacing;
     if (!existing) where.textContent = "Agents will know it as " + target();
   };
-  [f.title, f.newFolder].forEach((el) => el.addEventListener("input", sync));
-  [f.folder, f.kind].forEach((el) => el.addEventListener("change", sync));
+  [f.title, folder.el].forEach((el) => el.addEventListener("input", sync));
+  [folder.el, f.kind].forEach((el) => el.addEventListener("change", sync));
   const dlg = dialog(null,
     h("form", { onsubmit: async (e) => {
       e.preventDefault(); err.textContent = "";
@@ -569,7 +595,7 @@ function secretDialog(existing, done) {
         if (pol) { if (existing) meta.policy = pol; else body.policy = pol; }
       }
       try {
-        if (!existing && f.folder.value === "\u0000new" && !slug(f.newFolder.value)) { err.textContent = "Give the new folder a name."; return; }
+        if (!existing && !folder.valid()) { err.textContent = "Give the new folder a name."; return; }
         await api("POST", existing ? "/v1/secrets/update" : "/v1/secrets/create", body);
         if (!existing) state.selected = body.path;
         dlg.close(); toast(existing ? "Saved" : "Added to the vault"); done();
@@ -582,8 +608,7 @@ function secretDialog(existing, done) {
       f.title,
       genRow, contentRow,
       h("div", { class: "two gap" }, f.username, f.url),
-      !existing && h("div", { class: "two" }, h("div", {}, h("label", {}, "Folder"), f.folder), h("div", {}, h("label", {}, "Kind"), f.kind)),
-      !existing && newFolderRow,
+      !existing && h("div", { class: "two" }, h("div", {}, h("label", {}, "Folder"), folder.el), h("div", {}, h("label", {}, "Kind"), f.kind)),
       h("div", { class: "stack" }, f.tags, f.notes),
       err,
       h("div", { class: "actions" }, h("button", { class: "btn primary", type: "submit" }, existing ? "Save changes" : "Add to vault"),
@@ -596,19 +621,21 @@ function secretDialog(existing, done) {
 }
 
 function moveDialog(d, done) {
-  const sel = folderSelect(folderOf(d.path));
+  const picker = folderPicker(folderOf(d.path));
   const err = h("div", { class: "error" });
   const dlg = dialog(null,
     h("form", { onsubmit: async (e) => {
       e.preventDefault(); err.textContent = "";
-      const np = (sel.value ? sel.value + "/" : "") + leafOf(d.path);
+      if (!picker.valid()) { err.textContent = "Give the new folder a name."; return; }
+      const dir = picker.value();
+      const np = (dir ? dir + "/" : "") + leafOf(d.path);
       if (np === d.path) return dlg.close();
-      try { await api("POST", "/v1/secrets/move", { path: d.path, new_path: np }); state.selected = np; dlg.close(); toast("Moved to " + folderLabel(sel.value)); done(); }
+      try { await api("POST", "/v1/secrets/move", { path: d.path, new_path: np }); state.selected = np; dlg.close(); toast("Moved to " + folderLabel(dir)); done(); }
       catch (ex) { err.textContent = ex.status === 409 ? "That folder already has an item with this name." : ex.message; }
     } },
       h("h3", {}, "Move " + (d.meta.title || pretty(leafOf(d.path)))),
       h("p", { class: "hint" }, "History and rotation setup move with it. Its address changes, so anything that refers to the old address must be updated."),
-      h("label", {}, "Move to folder"), sel, err,
+      h("label", {}, "Move to"), picker.el, err,
       h("div", { class: "actions" }, h("button", { class: "btn primary", type: "submit" }, "Move"),
         h("button", { class: "btn ghost", type: "button", onclick: () => dlg.close() }, "Cancel"))));
   dlg.showModal();
@@ -617,13 +644,25 @@ function moveDialog(d, done) {
 function folderDialog(folder, done) {
   const err = h("div", { class: "error" });
   const name = h("input", { type: "text", value: folder ? pretty(leafOf(folder.path)) : "", placeholder: "Personal, Work, Business…", autocomplete: "off", required: true, autofocus: true });
-  const parent = folderSelect(folder ? folderOf(folder.path) : state.folder || "", { exclude: folder && folder.path, rootLabel: "Top level" });
-  const dest = () => { const leaf = slug(name.value); return leaf ? (parent.value ? parent.value + "/" : "") + leaf : ""; };
+  const parent = folderPicker(folder ? folderOf(folder.path) : state.folder || "", { exclude: folder && folder.path, label: "Inside" });
+  const dest = () => { const leaf = slug(name.value); const dir = parent.value(); return leaf ? (dir ? dir + "/" : "") + leaf : ""; };
+  // Tokens are limited to folders by address, and do not follow a rename.
+  const warn = h("p", { class: "error", hidden: true });
+  if (folder && isAdmin()) {
+    api("GET", "/v1/tokens").then((tokens) => {
+      const hit = tokens.filter((t) => !t.revoked_at && !(t.expires_at && t.expires_at * 1000 < Date.now()) && t.rules.some((r) => r.path === folder.path || r.path.startsWith(folder.path + "/")));
+      if (!hit.length) return;
+      warn.textContent = `${hit.length === 1 ? "The access token " + hit[0].name + " is" : "The access tokens " + hit.map((t) => t.name).join(", ") + " are"} limited to this folder. After a rename or move ${hit.length === 1 ? "it" : "they"} will no longer reach these items; create ${hit.length === 1 ? "a new token" : "new tokens"} for the new name.`;
+      warn.hidden = false;
+    }).catch(() => { /* the warning is a courtesy */ });
+  }
   const finish = (msg, sel) => { if (sel !== undefined) state.folder = sel; dlg.close(); toast(msg); done(); };
   async function save(e) {
     e.preventDefault(); err.textContent = "";
+    if (!parent.valid()) { err.textContent = "Give the new parent folder a name."; return; }
     const to = dest();
     if (!to) { err.textContent = "Use letters or numbers in the name."; return; }
+    if (to === "sys" || to.startsWith("sys/")) { err.textContent = "That name is kept for the vault itself. Choose another."; return; }
     try {
       if (!folder) { await api("POST", "/v1/folders/create", { path: to }); return finish("Folder created", to); }
       if (to === folder.path) return dlg.close();
@@ -635,21 +674,22 @@ function folderDialog(folder, done) {
   if (folder) {
     const keep = h("input", { type: "radio", name: "what", checked: true });
     const drop = h("input", { type: "radio", name: "what" });
-    const where = folderSelect(folderOf(folder.path), { exclude: folder.path, rootLabel: "Top level (no folder)" });
+    const where = folderPicker(folderOf(folder.path), { exclude: folder.path, label: "Move the items to" });
     const n = folder.count;
     removal = h("div", { class: "danger-zone" },
       h("h4", {}, "Delete this folder"),
       n === 0 ? h("p", { class: "hint" }, "This folder is empty.")
         : h("div", {},
             h("p", { class: "hint" }, `It contains ${n} item${n === 1 ? "" : "s"}, including any in sub-folders. What should happen to ${n === 1 ? "it" : "them"}?`),
-            h("label", { class: "check" }, keep, "Move " + (n === 1 ? "it" : "them") + " to"), where,
+            h("label", { class: "check" }, keep, "Move " + (n === 1 ? "it" : "them") + " to"), where.el,
             h("label", { class: "check" }, drop, `Delete ${n === 1 ? "it" : "all " + n} as well`)),
       h("div", { class: "actions" }, h("button", { class: "btn danger outline", type: "button", onclick: async () => {
         err.textContent = "";
         const wipe = n > 0 && drop.checked;
         if (wipe && !confirm(`Delete the folder ${folderLabel(folder.path)} and the ${n} item${n === 1 ? "" : "s"} in it?`)) return;
         const body = { path: folder.path };
-        if (!wipe) body.move_to = n === 0 ? folderOf(folder.path) : where.value;
+        if (!wipe && n > 0 && !where.valid()) { err.textContent = "Give the new folder a name."; return; }
+        if (!wipe) body.move_to = n === 0 ? folderOf(folder.path) : where.value();
         try { await api("POST", "/v1/folders/delete", body); finish(wipe ? "Folder and items deleted" : "Folder deleted", ""); }
         catch (ex) { err.textContent = ex.status === 409 ? "The destination already has an item with the same name: " + ex.message : ex.message; }
       } }, "Delete folder")));
@@ -657,8 +697,9 @@ function folderDialog(folder, done) {
   const dlg = dialog(null,
     h("form", { onsubmit: save },
       h("h3", {}, folder ? "Folder " + folderLabel(folder.path) : "New folder"),
-      h("div", { class: "two" }, h("div", {}, h("label", {}, "Name"), name), h("div", {}, h("label", {}, "Inside"), parent)),
+      h("div", { class: "two" }, h("div", {}, h("label", {}, "Name"), name), h("div", {}, h("label", {}, "Inside"), parent.el)),
       folder && h("p", { class: "hint" }, "Renaming or moving a folder changes the address of everything in it."),
+      warn,
       h("div", { class: "actions" }, h("button", { class: "btn primary", type: "submit" }, folder ? "Save" : "Create folder"),
         h("button", { class: "btn ghost", type: "button", onclick: () => dlg.close() }, "Cancel")),
       removal, err));
@@ -710,7 +751,7 @@ async function viewTokens(main) {
       return h("tr", {},
         h("td", {}, t.name, h("div", { class: "hint mono" }, t.id)),
         h("td", {}, t.role),
-        h("td", { class: "mono" }, t.role === "admin" ? "everything" : t.rules.length ? t.rules.map((r) => h("div", {}, `${r.path}  ${r.caps.join(", ")}`)) : "nothing"),
+        h("td", {}, t.role === "admin" ? "Everything" : t.rules.length ? t.rules.map((r) => h("div", {}, h("b", {}, scopeLabel(r.path)), "  ", r.caps.map((c) => (CAPS[c] || [c])[0]).join(", "))) : "Nothing"),
         h("td", { class: "nw" }, fmt(t.last_used_at)), h("td", { class: "nw" }, t.expires_at ? fmt(t.expires_at) : "never"),
         h("td", {}, stateCell(st)),
         h("td", {}, st === "active" && t.id !== state.me.id && h("button", { class: "link danger", onclick: async () => {
@@ -722,28 +763,57 @@ async function viewTokens(main) {
   load();
 }
 
+// Permissions in the words a person would use, with the technical name the
+// CLI and access rules use.
+const CAPS = {
+  list: ["See items", "Names, sites, usernames and history. Never the passwords themselves."],
+  create: ["Add items", "Create new items; the vault generates the password."],
+  update: ["Edit details", "Change name, username, website, tags and notes."],
+  generate: ["Generate", "Have the vault make a new password without showing it."],
+  rotate: ["Rotate", "Change a password on the live system through its rotation setup."],
+  delete: ["Delete and move", "Delete items, or move them to another folder."],
+  write: ["Set passwords by hand", "Store a password of its own choosing, which it then knows. Needed for imports."],
+  reveal: ["Read passwords", "See the actual passwords. Never available to agents."],
+};
+const scopeLabel = (p) => (p === "**" ? "Everything" : p === "sys/update" ? "Vault updates" : p.endsWith("/**") ? folderLabel(p.slice(0, -3)) : p);
+const ALL = "\u0000all", CUSTOM = "\u0000custom";
+
 function tokenDialog(done) {
-  const caps = ["list", "create", "update", "generate", "rotate", "delete", "write", "reveal", "upgrade"];
-  const name = h("input", { type: "text", placeholder: "claude-homelab", required: true, pattern: "[A-Za-z0-9._\\-]{1,64}", autocomplete: "off", autofocus: true });
-  const role = h("select", {}, [["agent", "Agent (can never read passwords)"], ["human", "Person"], ["admin", "Admin (everything)"]].map(([r, l]) => h("option", { value: r }, l)));
-  const path = h("input", { type: "text", class: "mono", value: "infra/**", spellcheck: "false", autocomplete: "off" });
+  const name = h("input", { type: "text", placeholder: "claude-mac, backup-script…", required: true, pattern: "[A-Za-z0-9._\\-]{1,64}", title: "Letters, numbers, dots, dashes and underscores", autocomplete: "off", autofocus: true });
+  const role = h("select", {}, [["agent", "An agent or script (can never read passwords)"], ["human", "A person"], ["admin", "An admin (everything)"]].map(([r, l]) => h("option", { value: r }, l)));
+  const where = folderPicker(state.folder || ALL, { noRoot: true, label: "Where it applies", extra: [[ALL, "Everything in the vault"]], tail: [[CUSTOM, "A custom pattern…"]] });
+  const pattern = h("input", { type: "text", class: "mono", placeholder: "work/*/prod/**", spellcheck: "false", autocomplete: "off", hidden: true, "aria-label": "Custom pattern" });
+  pattern.style.marginTop = "8px";
   const ttl = h("input", { type: "number", min: "1", max: "3650", placeholder: "Never" });
-  const boxes = caps.map((c) => [c, h("input", { type: "checkbox", checked: ["list", "generate", "rotate"].includes(c) })]);
+  const boxes = Object.keys(CAPS).map((c) => [c, h("input", { type: "checkbox", checked: ["list", "create", "generate", "rotate"].includes(c) })]);
+  const updates = h("input", { type: "checkbox" });
   const err = h("div", { class: "error" });
-  const scope = h("div", {}, h("label", {}, "Where it applies"), path, h("label", {}, "What it may do"),
-    h("div", { class: "opts row" }, boxes.map(([c, b]) => h("label", { class: "chip" }, b, h("span", {}, c)))));
+  const scope = h("div", {}, h("label", {}, "Where it applies"), where.el, pattern, h("label", {}, "What it may do"),
+    h("div", { class: "opts row plain" }, boxes.map(([c, b]) => h("label", { class: "chip", title: CAPS[c][1] }, b, h("span", {}, CAPS[c][0])))),
+    h("label", { class: "check", title: "Check for and install signed vault releases. Installing restarts the vault sealed." }, updates, "May install vault updates"));
   const sync = () => {
     scope.hidden = role.value === "admin";
+    pattern.hidden = where.raw() !== CUSTOM;
     const rv = boxes.find(([c]) => c === "reveal");
     rv[1].disabled = role.value === "agent";
     if (role.value === "agent") rv[1].checked = false;
   };
   role.addEventListener("change", sync);
+  where.el.addEventListener("change", sync);
   const form = h("form", { onsubmit: async (e) => {
     e.preventDefault(); err.textContent = "";
     const body = { name: name.value.trim(), role: role.value, rules: [], ttl_days: ttl.value ? Number(ttl.value) : null };
-    if (role.value !== "admin") body.rules = [{ path: path.value.trim(), caps: boxes.filter(([, b]) => b.checked).map(([c]) => c) }];
     try {
+      if (role.value !== "admin") {
+        let path;
+        if (where.raw() === ALL) path = "**";
+        else if (where.raw() === CUSTOM) { path = pattern.value.trim(); if (!path) { err.textContent = "Type the pattern, or pick a folder."; return; } }
+        else path = (await where.ensure()) + "/**";
+        const caps = boxes.filter(([, b]) => b.checked).map(([c]) => c);
+        if (!caps.length && !updates.checked) { err.textContent = "Choose at least one thing it may do."; return; }
+        if (caps.length) body.rules.push({ path, caps });
+        if (updates.checked) body.rules.push({ path: "sys/update", caps: ["upgrade"] });
+      }
       const r = await api("POST", "/v1/tokens/create", body);
       form.replaceChildren(h("h3", {}, "Token created"), h("p", { class: "hint" }, "Copy it now. It is shown once and cannot be recovered."),
         h("div", { class: "once" }, r.token),

@@ -9,7 +9,7 @@ UI, CLI, and MCP server.
 
 ## How agents rotate a password they never see
 
-1. Agent calls `secret_rotate("infra/pve/root")` over MCP (or `jaword rotate`).
+1. Agent calls `secret_rotate("home-lab/proxmox-root")` over MCP (or `jaword rotate`).
 2. The vault generates the new value and stores it as a `pending` version.
 3. The vault's rotation driver pushes it to the real system (SSH command or
    local program). The secret travels on the child's stdin only.
@@ -46,7 +46,7 @@ secrets, rolling a version back, upgrading a token to admin, un-revoking a
 token) is detected rather than obeyed. API tokens are stored only as HMACs.
 
 **Access.** Tokens have a role (`admin`, `human`, `agent`) and path rules like
-`infra/**=list,generate,rotate`. Capabilities: `list create update generate
+`home-lab/**=list,generate,rotate`. Capabilities: `list create update generate
 rotate delete write reveal`. `write` (supplying a value yourself) is separate
 from `update` (metadata), so an agent cannot set a secret to something it
 knows. Default deny.
@@ -78,17 +78,17 @@ read-only filesystem, no core dumps), container has swap disabled.
 ## Daily use
 
 ```bash
-jaword ls infra/
-jaword new infra/gitea/admin --username admin        # value generated in vault
-jaword rotate infra/pve/root                         # push new value via driver
-jaword show infra/pve/root                           # metadata + history
-jaword reveal infra/pve/root                         # humans only
-jaword run -e PGPASSWORD=infra/db/app -- psql ...    # inject into one command
+jaword ls home-lab/
+jaword new home-lab/gitea-admin --username admin        # value generated in vault
+jaword rotate home-lab/proxmox-root                         # push new value via driver
+jaword show home-lab/proxmox-root                           # metadata + history
+jaword reveal home-lab/proxmox-root                         # humans only
+jaword run -e PGPASSWORD=work/database -- psql ...    # inject into one command
 jaword audit --verify
 ```
 
 Every item has a **path** (its unique address, used by access rules and
-agents, e.g. `infra/pve/root`) plus ordinary fields: name, website, username,
+agents, e.g. `home-lab/proxmox-root`) plus ordinary fields: name, website, username,
 tags, notes.
 
 ### Folders
@@ -135,7 +135,7 @@ run `jaword unseal`.
 ```
 
 ```bash
-jaword driver infra/pve/root --file driver.json
+jaword driver home-lab/proxmox-root --file driver.json
 ```
 
 `{{new}}`, `{{old}}`, `{{username}}` are allowed in `stdin` only, never in the

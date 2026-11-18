@@ -13,7 +13,7 @@ const POLICY_SCHEMA: &str = r#"{"type":"object","description":"Generation policy
 
 fn tools() -> Value {
     let policy: Value = serde_json::from_str(POLICY_SCHEMA).unwrap_or(Value::Null);
-    let path = json!({"type": "string", "description": "Secret path, lowercase segments, e.g. infra/pve/root"});
+    let path = json!({"type": "string", "description": "Secret path, lowercase segments, e.g. home-lab/proxmox-root"});
     json!([
         {
             "name": "vault_status",
@@ -23,7 +23,7 @@ fn tools() -> Value {
         {
             "name": "secret_list",
             "description": "List secrets this agent may see (path, kind, version, metadata). Never returns secret values.",
-            "inputSchema": {"type": "object", "properties": {"prefix": {"type": "string", "description": "Optional path prefix, e.g. infra/"}}}
+            "inputSchema": {"type": "object", "properties": {"prefix": {"type": "string", "description": "Optional path prefix, e.g. home-lab/"}}}
         },
         {
             "name": "secret_get",

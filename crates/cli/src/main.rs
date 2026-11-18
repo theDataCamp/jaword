@@ -217,7 +217,7 @@ enum UpdateCmd {
 
 #[derive(Subcommand)]
 enum TokenCmd {
-    /// Create a token. Rules look like 'infra/**=list,generate,rotate'
+    /// Create a token. Rules look like 'home-lab/**=list,generate,rotate'
     Create {
         name: String,
         #[arg(long, default_value = "agent")]
@@ -463,7 +463,7 @@ fn print_secret_line(v: &Value) {
 }
 
 fn parse_rule(r: &str) -> Value {
-    let (path, caps) = r.split_once('=').unwrap_or_else(|| die("rule must look like 'infra/**=list,rotate'"));
+    let (path, caps) = r.split_once('=').unwrap_or_else(|| die("rule must look like 'home-lab/**=list,rotate'"));
     let caps: Vec<&str> = caps.split(',').map(str::trim).filter(|c| !c.is_empty()).collect();
     json!({"path": path, "caps": caps})
 }

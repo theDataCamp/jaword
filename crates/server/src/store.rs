@@ -820,6 +820,9 @@ impl Vault {
     ) -> R<SecretView> {
         let r = (|| {
             a.require(Cap::Create, path)?;
+            if access::reserved(path) {
+                return bad("`sys` is reserved for the vault itself; choose another folder name");
+            }
             if value.is_some() {
                 a.require(Cap::Write, path)?;
             }
@@ -1026,6 +1029,9 @@ impl Vault {
         a.require(Cap::Delete, from)?;
         a.require(Cap::List, from)?;
         a.require(Cap::Create, to)?;
+        if access::reserved(to) {
+            return bad("`sys` is reserved for the vault itself; choose another folder name");
+        }
         if a.role != Role::Admin && a.can(Cap::Reveal, to) && !a.can(Cap::Reveal, from) {
             return Err(VErr::Forbidden);
         }
@@ -1341,7 +1347,7 @@ impl Vault {
 }
 
 fn valid_folder(p: &str) -> bool {
-    access::valid_path(p) && p.len() <= 150
+    access::valid_path(p) && p.len() <= 150 && !access::reserved(p)
 }
 
 /// Remove the remembered-folder rows at and under `from`; with `to`, recreate
@@ -1886,6 +1892,26 @@ mod tests {
         assert!(matches!(v.move_secret(&h, "work/vpn", "personal/vpn"), Err(VErr::Forbidden)));
         assert!(matches!(v.move_folder(&h, "work", "personal/work"), Err(VErr::Forbidden)));
         assert_eq!(v.reveal(&root, "work/vpn", None).unwrap().as_str(), "vpn-password");
+    }
+
+    #[test]
+    fn sys_is_reserved() {
+        let (v, root, _) = vault();
+        v.create(&root, "personal/a", "password", Meta::default(), None, None).unwrap();
+        assert!(matches!(v.create(&root, "sys/update", "password", Meta::default(), None, None), Err(VErr::BadRequest(_))));
+        assert!(matches!(v.create(&root, "sys/x/y", "password", Meta::default(), None, None), Err(VErr::BadRequest(_))));
+        assert!(matches!(v.create_folder(&root, "sys"), Err(VErr::BadRequest(_))));
+        assert!(matches!(v.move_secret(&root, "personal/a", "sys/a"), Err(VErr::BadRequest(_))));
+        assert!(matches!(v.move_folder(&root, "personal", "sys"), Err(VErr::BadRequest(_))));
+        assert!(matches!(v.delete_folder(&root, "personal", Some("sys")), Err(VErr::BadRequest(_))));
+        // Folder tokens can no longer carry the update permission.
+        assert!(matches!(
+            v.create_token(&root, "t", Role::Agent, vec![Rule { path: "personal/**".into(), caps: vec![Cap::List, Cap::Upgrade] }], None),
+            Err(VErr::BadRequest(_))
+        ));
+        let (_, t) = v.create_token(&root, "updater", Role::Agent, vec![Rule { path: "sys/update".into(), caps: vec![Cap::Upgrade] }], None).unwrap();
+        assert!(v.authorize_upgrade(&v.authenticate(&t).unwrap(), "check").is_ok());
+        assert!(v.get(&root, "personal/a").is_ok());
     }
 
     #[test]

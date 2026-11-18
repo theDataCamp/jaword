@@ -3,8 +3,15 @@
 use serde::{Deserialize, Serialize};
 
 pub const MAX_PATH_LEN: usize = 200;
+/// Fixed address the `upgrade` capability is granted on.
+pub const SYS_UPDATE: &str = "sys/update";
 
-/// Paths look like `infra/pve/root`: lowercase segments of `[a-z0-9._-]`,
+/// `sys` is kept for the vault's own addresses; no item or folder may live there.
+pub fn reserved(path: &str) -> bool {
+    path == "sys" || path.starts_with("sys/")
+}
+
+/// Paths look like `home-lab/proxmox-root`: lowercase segments of `[a-z0-9._-]`,
 /// each starting with an alphanumeric. No traversal, no empty segments.
 pub fn valid_path(p: &str) -> bool {
     if p.is_empty() || p.len() > MAX_PATH_LEN {
@@ -137,6 +144,12 @@ pub fn validate_rules(role: Role, rules: &[Rule]) -> Result<(), &'static str> {
         if role == Role::Agent && r.caps.contains(&Cap::Reveal) {
             return Err("agent tokens cannot hold reveal");
         }
+        // `upgrade` is a vault-wide power, so it is only ever granted on its
+        // own fixed address and never rides along with a folder rule.
+        let on_sys = r.path == SYS_UPDATE;
+        if r.caps.contains(&Cap::Upgrade) != on_sys || (on_sys && r.caps.len() != 1) {
+            return Err("the upgrade permission is granted on sys/update, on its own");
+        }
     }
     Ok(())
 }
@@ -191,5 +204,13 @@ mod tests {
         assert!(!allowed(Role::Agent, &[], Cap::List, "infra/x"));
         assert!(validate_rules(Role::Agent, &rules).is_err());
         assert!(validate_rules(Role::Human, &rules).is_ok());
+        // Upgrade cannot be attached to a folder, or bundled with other powers.
+        let up = |path: &str, caps: Vec<Cap>| validate_rules(Role::Agent, &[Rule { path: path.into(), caps }]);
+        assert!(up("sys/update", vec![Cap::Upgrade]).is_ok());
+        assert!(up("home-lab/**", vec![Cap::List, Cap::Upgrade]).is_err());
+        assert!(up("**", vec![Cap::Upgrade]).is_err());
+        assert!(up("sys/update", vec![Cap::Upgrade, Cap::List]).is_err());
+        assert!(up("sys/update", vec![Cap::List]).is_err());
+        assert!(reserved("sys") && reserved("sys/update") && !reserved("system/x") && !reserved("personal/sys"));
     }
 }
