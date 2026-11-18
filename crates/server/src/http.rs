@@ -176,7 +176,7 @@ async fn guard(State(app): S, req: Request, next: Next) -> Response {
     for (k, v) in [
         (
             header::CONTENT_SECURITY_POLICY,
-            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
         ),
         (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
         (header::X_FRAME_OPTIONS, "DENY"),
@@ -184,6 +184,10 @@ async fn guard(State(app): S, req: Request, next: Next) -> Response {
         (header::CACHE_CONTROL, "no-store"),
         (header::STRICT_TRANSPORT_SECURITY, "max-age=31536000"),
     ] {
+        // Static assets (fonts) may set their own caching; everything else is no-store.
+        if k == header::CACHE_CONTROL && h.contains_key(header::CACHE_CONTROL) {
+            continue;
+        }
         h.insert(k, HeaderValue::from_static(v));
     }
     h.insert("cross-origin-opener-policy", HeaderValue::from_static("same-origin"));
@@ -541,6 +545,23 @@ fn asset(ctype: &'static str, body: &'static str) -> Response {
         .expect("static response")
 }
 
+fn font(bytes: &'static [u8]) -> Response {
+    Response::builder()
+        .header(header::CONTENT_TYPE, "font/woff2")
+        .header(header::CACHE_CONTROL, "private, max-age=604800")
+        .body(Body::from(bytes))
+        .expect("static response")
+}
+async fn font_display() -> Response {
+    font(include_bytes!("../ui/fonts/besley.woff2"))
+}
+async fn font_text() -> Response {
+    font(include_bytes!("../ui/fonts/atkinson-next.woff2"))
+}
+async fn font_mono() -> Response {
+    font(include_bytes!("../ui/fonts/atkinson-mono.woff2"))
+}
+
 async fn ui_index() -> Response {
     asset("text/html; charset=utf-8", include_str!("../ui/index.html"))
 }
@@ -556,6 +577,9 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/", get(ui_index))
         .route("/app.js", get(ui_js))
         .route("/style.css", get(ui_css))
+        .route("/fonts/besley.woff2", get(font_display))
+        .route("/fonts/atkinson-next.woff2", get(font_text))
+        .route("/fonts/atkinson-mono.woff2", get(font_mono))
         .route("/v1/sys/status", get(status))
         .route("/v1/sys/init", post(init))
         .route("/v1/sys/unseal", post(unseal))

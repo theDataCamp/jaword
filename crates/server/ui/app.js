@@ -74,8 +74,9 @@ function armIdle() {
 // ------------------------------------------------------------------ gates
 
 function gate(title, text, ...body) {
+  const sealed = title === "Sealed";
   root.replaceChildren(h("div", { class: "gate" }, h("div", { class: "card" },
-    h("div", { class: "brand" }, h("div", { class: "mark" }, "j"), h("span", {}, "jaword")),
+    h("div", { class: "dial" + (sealed ? " sealed" : ""), "aria-hidden": "true" }),
     h("h1", {}, title), h("p", {}, text), ...body)));
 }
 
@@ -97,19 +98,25 @@ async function boot() {
   try { st = await api("GET", "/v1/sys/status"); }
   catch (e) { return gate("Vault unreachable", e.message, h("button", { class: "btn", onclick: boot }, "Retry")); }
   if (!st.initialized) {
-    return gate("Not initialized", "Create the vault from a terminal so the recovery key never passes through a browser.",
+    return gate("Not set up yet", "Create the vault from a terminal on its host, so the recovery key never passes through a browser.",
       h("p", {}, h("code", {}, "jaword init")), h("button", { class: "btn", onclick: boot }, "Check again"));
   }
   if (st.sealed) {
-    return gate("Vault is sealed", "Encryption keys are not in memory. Enter the unseal passphrase or recovery key.",
-      gateForm("Passphrase", "unseal passphrase", "Unseal", async (v) => { await api("POST", "/v1/sys/unseal", { credential: v }); boot(); }));
+    return gate("Sealed", "Nothing can be read until the passphrase or recovery key is entered.",
+      gateForm("Passphrase", "", "Unseal", async (v) => {
+        await api("POST", "/v1/sys/unseal", { credential: v });
+        // The dial turns once the vault has actually opened.
+        const dial = document.querySelector(".dial");
+        if (dial) dial.className = "dial open";
+        setTimeout(boot, matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 700);
+      }));
   }
   if (state.token) {
     try { state.me = await api("GET", "/v1/whoami"); armIdle(); return shell(); }
     catch (e) { state.token = null; try { sessionStorage.removeItem("jaword.token"); } catch (_) { /* ignore */ } }
   }
-  gate("Sign in", "Paste your API token. It is kept for this tab only.",
-    gateForm("Token", "jw_…", "Sign in", async (v) => {
+  gate("jaword", "Paste your access token. It stays in this tab and is gone when you close it.",
+    gateForm("Access token", "jw_…", "Open vault", async (v) => {
       state.token = v.trim();
       try { state.me = await api("GET", "/v1/whoami"); }
       catch (e) { state.token = null; throw e; }
@@ -123,7 +130,7 @@ async function boot() {
 const isAdmin = () => state.me && state.me.role === "admin";
 
 function shell() {
-  const views = [["secrets", "Secrets"]];
+  const views = [["secrets", "Vault"]];
   if (isAdmin()) views.push(["tokens", "Tokens"], ["audit", "Audit log"], ["updates", "Updates"]);
   const main = h("main", { class: "main" });
   const nav = views.map(([id, label]) => h("button", { class: "nav" + (state.view === id ? " on" : ""), onclick: () => { state.view = id; shell(); } }, label));
@@ -172,13 +179,14 @@ function folderSelect(selected, opts) {
 }
 
 async function viewSecrets(main) {
+  const heading = h("h2", {}, "All items");
   const treeEl = h("nav", { class: "tree", "aria-label": "Folders" });
   const listEl = h("div", { class: "list" });
   const detailEl = h("div", {});
   const search = h("input", { type: "search", placeholder: "Search name, site, user or tag", value: state.filter, "aria-label": "Search",
     oninput: (e) => { state.filter = e.target.value; renderList(); } });
   main.replaceChildren(
-    h("div", { class: "head" }, h("h2", {}, "Secrets"), h("div", { class: "grow" }, search),
+    h("div", { class: "head" }, heading, h("div", { class: "grow" }, search),
       h("button", { class: "btn", onclick: () => folderDialog(null, reload) }, "New folder"),
       h("button", { class: "btn primary", onclick: () => secretDialog(null, reload) }, "New item")),
     h("div", { class: "split3" }, treeEl, listEl, detailEl));
@@ -186,6 +194,7 @@ async function viewSecrets(main) {
   const pick = (f) => { state.folder = f; renderTree(); renderList(); };
 
   function renderTree() {
+    heading.textContent = state.folder ? pretty(leafOf(state.folder)) : "All items";
     const all = h("button", { class: "fold" + (!state.folder ? " on" : ""), onclick: () => pick("") }, h("span", { class: "grow" }, "All items"), h("span", { class: "cnt" }, state.secrets.length));
     const rows = state.folders.map((f) => {
       const b = h("button", { class: "fold" + (state.folder === f.path ? " on" : ""), onclick: () => pick(f.path), title: f.path },
@@ -236,7 +245,7 @@ function secretPanel(d, reload) {
   async function reveal(version) {
     try {
       const v = await fetchValue(version);
-      val.textContent = v; val.className = "val shown";
+      paint(val, v); val.className = "val shown";
       let left = REVEAL_SECONDS;
       const label = version ? `Version ${version}. ` : "";
       note.textContent = `${label}Hides in ${left}s.`;
@@ -296,71 +305,158 @@ function secretPanel(d, reload) {
         h("td", {}, h("button", { class: "btn small ghost", onclick: () => reveal(v.version) }, "Reveal"))))))));
 }
 
+// ---- password generator -------------------------------------------------
+// Runs in the browser with the platform CSPRNG and rejection sampling (no
+// modulo bias), mirroring the server's generator and its character sets.
+const GEN = { lower: "abcdefghijklmnopqrstuvwxyz", upper: "ABCDEFGHIJKLMNOPQRSTUVWXYZ", digits: "0123456789", symbols: "!@#%^*-_=+", alike: "Il1O0o" };
+
+function randInt(n) {
+  const zone = 4294967296 - (4294967296 % n);
+  const b = new Uint32Array(1);
+  for (;;) { crypto.getRandomValues(b); if (b[0] < zone) return b[0] % n; }
+}
+
+function poolFor(o) {
+  return ["lower", "upper", "digits", "symbols"].filter((k) => o[k]).map((k) => [...GEN[k]].filter((c) => !(o.plain && GEN.alike.includes(c))));
+}
+
+function makePassword(o) {
+  const sets = poolFor(o);
+  if (!sets.length) return "";
+  const all = sets.flat();
+  const out = sets.map((set) => set[randInt(set.length)]);
+  while (out.length < o.length) out.push(all[randInt(all.length)]);
+  for (let i = out.length - 1; i > 0; i--) { const k = randInt(i + 1); [out[i], out[k]] = [out[k], out[i]]; }
+  return out.join("");
+}
+
+// Digits in brass, symbols in verdigris: easier to read back and to compare.
+function paint(el, value) {
+  el.replaceChildren(...[...value].map((c) => h("span", { class: /[0-9]/.test(c) ? "c-d" : /[A-Za-z]/.test(c) ? null : "c-s" }, c)));
+}
+
+function generator(policy) {
+  const o = { length: 24, lower: true, upper: true, digits: true, symbols: true, plain: false };
+  if (policy && policy.type === "password") Object.assign(o, { length: Math.min(64, policy.length || 24), lower: policy.lower !== false, upper: policy.upper !== false, digits: policy.digits !== false, symbols: policy.symbols !== "", plain: !!policy.exclude_ambiguous });
+  let typed = false;
+  const field = h("input", { type: "text", autocomplete: "off", autocapitalize: "off", spellcheck: "false", "aria-label": "Password" });
+  const range = h("input", { type: "range", min: "12", max: "64", step: "1", value: String(o.length), id: "gen-len" });
+  const out = h("output", { for: "gen-len" }, String(o.length));
+  const fill = h("i", {});
+  const bar = h("div", { class: "bar" }, fill);
+  const words = h("span", {});
+  const chip = (key, label, title) => {
+    const box = h("input", { type: "checkbox", checked: o[key], "aria-label": title });
+    box.addEventListener("change", () => {
+      o[key] = box.checked;
+      if (!poolFor(o).length) { o[key] = true; box.checked = true; return; }   // keep at least one set
+      roll();
+    });
+    return h("label", { class: "chip", title }, box, h("span", {}, label));
+  };
+  function meter() {
+    const v = field.value;
+    let bits;
+    if (typed) {
+      const pool = (/[a-z]/.test(v) ? 26 : 0) + (/[A-Z]/.test(v) ? 26 : 0) + (/[0-9]/.test(v) ? 10 : 0) + (/[^A-Za-z0-9]/.test(v) ? 20 : 0);
+      bits = v.length * Math.log2(pool || 1);
+    } else bits = o.length * Math.log2(poolFor(o).flat().length);
+    const grade = bits < 60 ? "weak" : bits < 90 ? "fair" : "";
+    bar.className = "bar " + grade;
+    fill.style.width = Math.min(100, Math.round(bits / 1.6)) + "%";
+    words.textContent = typed
+      ? `Typed by hand, ${v.length} characters. ${grade === "weak" ? "Too easy to guess." : grade === "fair" ? "Acceptable." : "Strong, if it is not reused or a phrase."}`
+      : `${grade === "weak" ? "Weak" : grade === "fair" ? "Good" : "Strong"}, about ${Math.round(bits)} bits of randomness`;
+  }
+  function roll() { typed = false; field.value = makePassword(o); out.textContent = String(o.length); range.value = String(o.length); meter(); }
+  range.addEventListener("input", () => { o.length = Number(range.value); roll(); });
+  field.addEventListener("input", () => { typed = true; meter(); });
+  const el = h("div", { class: "gen" },
+    h("div", { class: "pw" }, field,
+      h("button", { class: "btn small", type: "button", title: "Make a different one", onclick: roll }, "New"),
+      h("button", { class: "btn small", type: "button", onclick: async () => { try { await navigator.clipboard.writeText(field.value); toast("Copied"); } catch (_) { toast("Copy failed, select it by hand", true); } } }, "Copy")),
+    h("div", { class: "len" }, h("label", { for: "gen-len" }, "Length"), range, out),
+    h("div", { class: "opts" }, chip("lower", "a–z", "Lowercase letters"), chip("upper", "A–Z", "Capital letters"), chip("digits", "0–9", "Digits"), chip("symbols", "!@#", "Symbols"), chip("plain", "no l1O0", "Leave out characters that look alike")),
+    h("div", { class: "strength" }, bar, words));
+  roll();
+  return {
+    el,
+    value: () => field.value,
+    // Remembered so rotations keep the same shape; null when typed by hand.
+    policy: () => (typed ? null : { type: "password", length: o.length, lower: o.lower, upper: o.upper, digits: o.digits, symbols: o.symbols ? null : "", exclude_ambiguous: o.plain }),
+  };
+}
+
 function secretDialog(existing, done) {
   const m = existing ? existing.meta : { title: "", username: "", url: "", notes: "", tags: [] };
+  const kinds = [["password", "Login or password"], ["api_key", "API key"], ["ssh_key", "SSH key"], ["config", "Configuration"], ["note", "Secure note"]];
   const f = {
     title: h("input", { type: "text", placeholder: "GitHub, Chase Bank, Proxmox root…", value: m.title || "", autocomplete: "off", maxlength: "200", autofocus: true, required: !existing }),
     folder: folderSelect(state.folder || "", { allowNew: true }),
-    newFolder: h("input", { type: "text", placeholder: "New folder name", autocomplete: "off" }),
-    kind: h("select", {}, [["password", "Login / password"], ["api_key", "API key"], ["ssh_key", "SSH key"], ["config", "Configuration"], ["note", "Secure note"]].map(([k, l]) => h("option", { value: k }, l))),
+    newFolder: h("input", { type: "text", placeholder: "Name of the new folder", autocomplete: "off" }),
+    kind: h("select", {}, kinds.map(([k, l]) => h("option", { value: k }, l))),
     username: h("input", { type: "text", value: m.username, autocomplete: "off" }),
     url: h("input", { type: "text", value: m.url, placeholder: "https://…", autocomplete: "off" }),
-    tags: h("input", { type: "text", value: m.tags.join(", "), placeholder: "comma separated", autocomplete: "off" }),
+    tags: h("input", { type: "text", value: m.tags.join(", "), placeholder: "Separate with commas", autocomplete: "off" }),
     notes: h("textarea", {}, m.notes),
-    own: h("input", { type: "checkbox" }),
-    value: h("input", { type: "password", autocomplete: "new-password", placeholder: existing ? "leave empty to keep the current one" : "your password" }),
-    length: h("input", { type: "number", min: "12", max: "256", value: "32" }),
-    symbols: h("input", { type: "checkbox", checked: true }),
+    content: h("textarea", { class: "mono", spellcheck: "false", placeholder: "Paste the key or text to keep safe" }),
   };
+  const gen = generator(existing && existing.meta.policy);
   const err = h("div", { class: "error" });
-  const addr = h("p", { class: "hint mono" });
-  const newFolderRow = h("div", { hidden: true }, h("label", {}, "New folder name"), f.newFolder);
-  const valueRow = h("div", { hidden: !existing }, h("label", {}, existing ? "Replace password (optional)" : "Password"), f.value);
-  const genRow = h("div", { class: "two", hidden: !!existing },
-    h("div", {}, h("label", {}, "Length"), f.length), h("label", { class: "check" }, f.symbols, "Include symbols"));
+  const addr = h("p", { class: "hint" });
+  const newFolderRow = h("div", { hidden: true }, h("label", {}, "New folder"), f.newFolder);
+  const genRow = h("div", {}, h("label", {}, existing ? "New password" : "Password"), gen.el);
+  const contentRow = h("div", { hidden: true }, h("label", {}, "Content"), f.content);
+  // When editing, the secret itself only changes if the person asks for that.
+  let replacing = !existing;
+  const replaceBtn = h("button", { class: "btn", type: "button", onclick: () => { replacing = true; sync(); } }, "Change the password");
+  const generated = () => ["password", "api_key"].includes(existing ? existing.kind : f.kind.value);
   const target = () => {
     const folder = f.folder.value === "\u0000new" ? slug(f.newFolder.value) : f.folder.value;
-    const leaf = slug(f.title.value) || "item";
-    return (folder ? folder + "/" : "") + leaf;
+    return (folder ? folder + "/" : "") + (slug(f.title.value) || "item");
   };
   const sync = () => {
     newFolderRow.hidden = f.folder.value !== "\u0000new";
-    valueRow.hidden = existing ? false : !f.own.checked;
-    genRow.hidden = existing ? true : f.own.checked;
-    if (!existing) addr.textContent = "Address for agents and access rules: " + target();
+    genRow.hidden = !replacing || !generated();
+    contentRow.hidden = !replacing || generated();
+    replaceBtn.hidden = replacing;
+    if (!existing) addr.textContent = "Agents and access rules will know it as " + target();
   };
   [f.title, f.newFolder].forEach((el) => el.addEventListener("input", sync));
-  [f.folder, f.own].forEach((el) => el.addEventListener("change", sync));
+  [f.folder, f.kind].forEach((el) => el.addEventListener("change", sync));
   const dlg = h("dialog", {},
     h("form", { onsubmit: async (e) => {
       e.preventDefault(); err.textContent = "";
       const meta = { title: f.title.value.trim(), username: f.username.value, url: f.url.value, notes: f.notes.value, tags: f.tags.value.split(",").map((t) => t.trim()).filter(Boolean) };
       if (existing && existing.meta.policy) meta.policy = existing.meta.policy;
+      const body = existing ? { path: existing.path, meta } : { path: target(), kind: f.kind.value, meta };
+      if (replacing) {
+        const value = generated() ? gen.value() : f.content.value;
+        if (!value) { err.textContent = generated() ? "The password is empty." : "Add the content to keep."; return; }
+        body.value = value;
+        const pol = generated() ? gen.policy() : null;
+        if (pol) { if (existing) meta.policy = pol; else body.policy = pol; }
+      }
       try {
-        if (existing) {
-          const body = { path: existing.path, meta };
-          if (f.value.value) body.value = f.value.value;
-          await api("POST", "/v1/secrets/update", body);
-        } else {
-          if (f.folder.value === "\u0000new" && !slug(f.newFolder.value)) { err.textContent = "Give the new folder a name."; return; }
-          const body = { path: target(), kind: f.kind.value, meta };
-          if (f.own.checked) body.value = f.value.value;
-          else body.policy = { type: "password", length: Number(f.length.value), symbols: f.symbols.checked ? null : "" };
-          await api("POST", "/v1/secrets/create", body);
-          state.selected = body.path;
-        }
-        dlg.close(); toast(existing ? "Saved" : "Created"); done();
-      } catch (ex) { err.textContent = ex.status === 409 ? "An item with that name already exists in this folder." : ex.message; }
+        if (!existing && f.folder.value === "\u0000new" && !slug(f.newFolder.value)) { err.textContent = "Give the new folder a name."; return; }
+        await api("POST", existing ? "/v1/secrets/update" : "/v1/secrets/create", body);
+        if (!existing) state.selected = body.path;
+        dlg.close(); toast(existing ? "Saved" : "Added to the vault"); done();
+      } catch (ex) {
+        err.textContent = ex.status === 409 ? "This folder already has an item with that name."
+          : ex.status === 403 && replacing ? "This access token may not set passwords by hand. Ask an admin for the write permission." : ex.message;
+      }
     } },
-      h("h3", {}, existing ? "Edit item" : "New item"),
+      h("h3", {}, existing ? "Edit " + (m.title || pretty(leafOf(existing.path))) : "New item"),
       h("label", {}, "Name"), f.title,
-      !existing && h("div", { class: "two" }, h("div", {}, h("label", {}, "Folder"), f.folder), h("div", {}, h("label", {}, "Type"), f.kind)),
+      !existing && h("div", { class: "two" }, h("div", {}, h("label", {}, "Folder"), f.folder), h("div", {}, h("label", {}, "Kind"), f.kind)),
       !existing && newFolderRow,
+      genRow, contentRow,
       h("div", { class: "two" }, h("div", {}, h("label", {}, "Username"), f.username), h("div", {}, h("label", {}, "Website"), f.url)),
       h("label", {}, "Tags"), f.tags, h("label", {}, "Notes"), f.notes,
-      !existing && h("label", { class: "check" }, f.own, "I'll type the password myself (otherwise a strong one is generated)"),
-      genRow, valueRow, !existing && addr, err,
-      h("div", { class: "row" }, h("button", { class: "btn primary", type: "submit" }, existing ? "Save" : "Create"),
+      !existing && addr, err,
+      h("div", { class: "row" }, h("button", { class: "btn primary", type: "submit" }, existing ? "Save changes" : "Add to vault"),
+        existing && replaceBtn,
         h("button", { class: "btn ghost", type: "button", onclick: () => dlg.close() }, "Cancel"))));
   document.body.append(dlg);
   dlg.addEventListener("close", () => dlg.remove());
@@ -592,20 +688,20 @@ async function viewUpdates(main) {
     let s;
     try { s = await api("GET", "/v1/sys/update"); }
     catch (e) { if (e.status) return fail(e); timer = setTimeout(load, 2000); return box.replaceChildren(h("p", { class: "hint" }, "Vault is restarting…")); }
-    const hp = s.helper || {};
+    const hp = (s.enabled && s.helper) || {};
     const latest = hp.latest || "";
     const newer = latest && latest !== s.current;
     box.replaceChildren(
       h("dl", { class: "kv" },
         h("dt", {}, "Installed"), h("dd", { class: "mono" }, s.current),
-        h("dt", {}, "Latest"), h("dd", { class: "mono" }, latest || "not checked yet"),
+        h("dt", {}, "Latest"), h("dd", { class: "mono" }, latest || "Not checked yet"),
         h("dt", {}, "Status"), h("dd", {}, hp.state ? h("span", { class: "pill " + (hp.state === "failed" ? "failed" : hp.state === "ok" ? "ok" : busy(hp.state) ? "pending" : "") }, hp.state) : "—", hp.message ? " " + hp.message : ""),
         h("dt", {}, "Last run"), h("dd", {}, hp.ts ? fmt(hp.ts) : "—")),
       s.enabled
         ? h("div", { class: "row" },
             h("button", { class: "btn", disabled: busy(hp.state), onclick: () => send({ action: "check" }) }, "Check for updates"),
             newer && h("button", { class: "btn primary", disabled: busy(hp.state), onclick: () => confirm(`Install ${latest}? The vault will restart and stay sealed until you enter the passphrase.`) && send({ action: "apply", version: latest }) }, "Install " + latest))
-        : h("p", { class: "error" }, "Updates are disabled: no release signing key is installed on the vault host."),
+        : h("p", {}, "Updates are switched off. They turn on once your release signing key is installed on the vault host, so that only releases you signed can ever be installed."),
       h("p", { class: "hint" }, "Only releases signed with your release key are accepted. The signature is checked by a separate root helper, not by the vault itself, and a version that fails to start is rolled back automatically."));
     if (busy(hp.state) || s.pending_request) timer = setTimeout(load, 1500);
   }
