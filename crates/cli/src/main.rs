@@ -116,6 +116,13 @@ enum Cmd {
     },
     /// Delete a secret (soft delete)
     Rm { path: String },
+    /// Move or rename a secret, e.g. `jaword mv work/vpn business/vpn`
+    Mv { path: String, new_path: String },
+    /// Manage folders
+    Folder {
+        #[command(subcommand)]
+        cmd: FolderCmd,
+    },
     /// Run a command with secrets injected as environment variables
     Run {
         /// NAME=secret/path (repeatable)
@@ -172,8 +179,40 @@ enum Cmd {
         #[arg(long)]
         verify: bool,
     },
+    /// Check for or install a signed vault release
+    Update {
+        #[command(subcommand)]
+        cmd: UpdateCmd,
+    },
     /// Run as an MCP server on stdio (for AI agents)
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum FolderCmd {
+    /// List folders with item counts
+    Ls,
+    /// Create an empty folder
+    New { path: String },
+    /// Rename or move a folder and everything in it
+    Mv { from: String, to: String },
+    /// Delete a folder. Deletes its items unless --move-to is given
+    Rm {
+        path: String,
+        /// Move the items here instead of deleting them ("" = top level)
+        #[arg(long)]
+        move_to: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum UpdateCmd {
+    /// Show installed version and the result of the last check or install
+    Status,
+    /// Ask the vault to look up the latest release
+    Check,
+    /// Install a release, e.g. `jaword update apply v0.2.0`. Restarts and seals the vault
+    Apply { version: String },
 }
 
 #[derive(Subcommand)]
@@ -648,6 +687,54 @@ fn main() {
             Ok(v) => out(&v),
             Err(e) => die(&e),
         },
+        Cmd::Mv { path, new_path } => {
+            check(c.post("/v1/secrets/move", &json!({"path": path, "new_path": new_path})));
+            println!("moved {path} -> {new_path}");
+        }
+        Cmd::Folder { cmd } => match cmd {
+            FolderCmd::Ls => {
+                let v = check(c.get("/v1/folders"));
+                if raw {
+                    out(&v)
+                } else {
+                    for f in v.as_array().into_iter().flatten() {
+                        println!("{:<50} {}", s(&f["path"]), f["count"]);
+                    }
+                }
+            }
+            FolderCmd::New { path } => {
+                check(c.post("/v1/folders/create", &json!({"path": path})));
+                println!("created folder {path}");
+            }
+            FolderCmd::Mv { from, to } => {
+                let v = check(c.post("/v1/folders/move", &json!({"from": from, "to": to})));
+                println!("moved {from} -> {to} ({} items)", v["moved"]);
+            }
+            FolderCmd::Rm { path, move_to } => {
+                let mut body = json!({"path": path});
+                if let Some(m) = &move_to {
+                    body["move_to"] = json!(m);
+                }
+                let v = check(c.post("/v1/folders/delete", &body));
+                println!("deleted folder {path}; {} items {}", v["items"], if move_to.is_some() { "moved" } else { "deleted" });
+            }
+        },
+        Cmd::Update { cmd } => {
+            let v = match cmd {
+                UpdateCmd::Status => check(c.get("/v1/sys/update")),
+                UpdateCmd::Check => {
+                    check(c.post("/v1/sys/update", &json!({"action": "check"})));
+                    std::thread::sleep(Duration::from_secs(4));
+                    check(c.get("/v1/sys/update"))
+                }
+                UpdateCmd::Apply { version } => {
+                    check(c.post("/v1/sys/update", &json!({"action": "apply", "version": version})));
+                    println!("install requested; the vault will restart and must then be unsealed");
+                    json!({"requested": version})
+                }
+            };
+            out(&v);
+        }
         Cmd::Token { cmd } => match cmd {
             TokenCmd::Create { name, role, rules, ttl_days } => {
                 let rules: Vec<Value> = rules.iter().map(|r| parse_rule(r)).collect();

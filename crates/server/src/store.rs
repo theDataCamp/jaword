@@ -185,6 +185,13 @@ pub struct SecretView {
 }
 
 #[derive(Debug, Serialize)]
+pub struct FolderView {
+    pub path: String,
+    /// Items in this folder and all folders beneath it.
+    pub count: usize,
+}
+
+#[derive(Debug, Serialize)]
 pub struct VersionView {
     pub version: i64,
     pub state: String,
@@ -303,6 +310,7 @@ CREATE TABLE IF NOT EXISTS tokens (
   last_used_at INTEGER,
   row_mac BLOB NOT NULL DEFAULT x''
 );
+CREATE TABLE IF NOT EXISTS folders (path TEXT PRIMARY KEY, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   ts INTEGER NOT NULL,
@@ -516,6 +524,15 @@ impl Vault {
         self.log(&a.label(), "sys.seal", "", "ok", "")?;
         *self.keys.write().unwrap_or_else(|p| p.into_inner()) = None;
         Ok(())
+    }
+
+    /// Gate and audit a self-update request. Admins, or tokens holding
+    /// `upgrade` on `sys/update`.
+    pub fn authorize_upgrade(&self, a: &Actor, detail: &str) -> R<()> {
+        let r = if a.role == Role::Admin { Ok(()) } else { a.require(Cap::Upgrade, "sys/update") };
+        let (o, _) = outcome(&r);
+        self.log(&a.label(), "sys.update", "", o, detail)?;
+        r
     }
 
     /// Re-wrap the master key under a new passphrase (vault must be unsealed).
@@ -983,6 +1000,205 @@ impl Vault {
         self.logged(a, "secret.delete", path, r)
     }
 
+    // ------------------------------------------------------------- folders
+    //
+    // A folder is simply a path prefix: `personal/github` lives in folder
+    // `personal`. The `folders` table only remembers folders that are empty,
+    // so a person can create one before putting anything in it.
+
+    /// Move one secret. Needs `delete`+`list` where it is and `create` where
+    /// it is going. A token that could read values at the destination but not
+    /// at the source is refused, so moving can never be used to gain `reveal`.
+    fn move_row(&self, tx: &Connection, k: &Keys, a: &Actor, from: &str, to: &str) -> R<()> {
+        a.require(Cap::Delete, from)?;
+        a.require(Cap::List, from)?;
+        a.require(Cap::Create, to)?;
+        if a.role != Role::Admin && a.can(Cap::Reveal, to) && !a.can(Cap::Reveal, from) {
+            return Err(VErr::Forbidden);
+        }
+        let s = self.load(tx, k, from)?;
+        let taken: i64 = tx.query_row("SELECT COUNT(*) FROM secrets WHERE path=?1", params![to], |r| r.get(0))?;
+        if taken > 0 {
+            return Err(VErr::Conflict(format!("an item already exists at {to}")));
+        }
+        tx.execute("UPDATE secrets SET path=?1, updated_at=?2 WHERE id=?3", params![to, now(), s.id])?;
+        reseal_secret_row(tx, k, &s.id)
+    }
+
+    pub fn move_secret(&self, a: &Actor, path: &str, new_path: &str) -> R<SecretView> {
+        let r = (|| {
+            if !access::valid_path(path) || !access::valid_path(new_path) || path == new_path {
+                return bad("invalid path, or the item is already there");
+            }
+            self.with_keys(|k| {
+                let mut db = self.db();
+                let tx = db.transaction()?;
+                self.move_row(&tx, k, a, path, new_path)?;
+                let s = self.load(&tx, k, new_path)?;
+                let v = self.view(&tx, k, &s)?;
+                tx.commit()?;
+                Ok(v)
+            })
+        })();
+        let (o, d) = outcome(&r);
+        let detail = if r.is_ok() { format!("moved to {new_path}") } else { d };
+        self.log(&a.label(), "secret.move", path, o, &detail)?;
+        r
+    }
+
+    pub fn folders(&self, a: &Actor) -> R<Vec<FolderView>> {
+        self.with_keys(|_| {
+            let db = self.db();
+            let mut st = db.prepare("SELECT path FROM secrets WHERE deleted_at IS NULL")?;
+            let paths = st.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+            let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+            for p in paths.iter().filter(|p| a.can(Cap::List, p)) {
+                let segs: Vec<&str> = p.split('/').collect();
+                for i in 1..segs.len() {
+                    *counts.entry(segs[..i].join("/")).or_insert(0) += 1;
+                }
+            }
+            let mut st = db.prepare("SELECT path FROM folders")?;
+            for f in st.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()? {
+                if a.can(Cap::List, &format!("{f}/x")) {
+                    // Show parents of an empty folder too.
+                    let segs: Vec<&str> = f.split('/').collect();
+                    for i in 1..=segs.len() {
+                        counts.entry(segs[..i].join("/")).or_insert(0);
+                    }
+                }
+            }
+            Ok(counts.into_iter().map(|(path, count)| FolderView { path, count }).collect())
+        })
+    }
+
+    pub fn create_folder(&self, a: &Actor, path: &str) -> R<()> {
+        let r = (|| {
+            if !valid_folder(path) {
+                return bad("invalid folder name");
+            }
+            a.require(Cap::Create, &format!("{path}/x"))?;
+            self.with_keys(|_| {
+                self.db().execute("INSERT OR IGNORE INTO folders (path, created_at) VALUES (?1, ?2)", params![path, now()])?;
+                Ok(())
+            })
+        })();
+        self.logged(a, "folder.create", path, r)
+    }
+
+    /// Rename or move a folder: every item under `from` is re-homed under
+    /// `to`, keeping sub-folders. All or nothing.
+    pub fn move_folder(&self, a: &Actor, from: &str, to: &str) -> R<usize> {
+        let r = (|| {
+            if !valid_folder(from) || !valid_folder(to) || from == to {
+                return bad("invalid folder, or nothing to change");
+            }
+            if to.starts_with(&format!("{from}/")) {
+                return bad("a folder cannot be moved inside itself");
+            }
+            self.with_keys(|k| {
+                let mut db = self.db();
+                let tx = db.transaction()?;
+                let n = self.rehome(&tx, k, a, from, to)?;
+                tx.execute("INSERT OR IGNORE INTO folders (path, created_at) VALUES (?1, ?2)", params![to, now()])?;
+                tx.commit()?;
+                Ok(n)
+            })
+        })();
+        let (o, d) = outcome(&r);
+        let detail = match &r {
+            Ok(n) => format!("moved to {to} ({n} items)"),
+            Err(_) => d,
+        };
+        self.log(&a.label(), "folder.move", from, o, &detail)?;
+        r
+    }
+
+    /// Delete a folder. With `move_to`, its items are moved there first
+    /// (pass an empty string for the top level); otherwise they are deleted.
+    pub fn delete_folder(&self, a: &Actor, path: &str, move_to: Option<&str>) -> R<usize> {
+        let r = (|| {
+            if !valid_folder(path) {
+                return bad("invalid folder");
+            }
+            if let Some(dest) = move_to {
+                if (!dest.is_empty() && !valid_folder(dest)) || dest == path || dest.starts_with(&format!("{path}/")) {
+                    return bad("choose a different folder to move the items to");
+                }
+            }
+            self.with_keys(|k| {
+                let mut db = self.db();
+                let tx = db.transaction()?;
+                let n = match move_to {
+                    Some(dest) => self.rehome(&tx, k, a, path, dest)?,
+                    None => {
+                        let prefix = format!("{path}/");
+                        let mut st = tx.prepare("SELECT path FROM secrets WHERE deleted_at IS NULL")?;
+                        let inside: Vec<String> = st
+                            .query_map([], |r| r.get::<_, String>(0))?
+                            .collect::<Result<Vec<_>, _>>()?
+                            .into_iter()
+                            .filter(|p| p.starts_with(&prefix))
+                            .collect();
+                        drop(st);
+                        for p in &inside {
+                            a.require(Cap::Delete, p)?;
+                            let s = self.load(&tx, k, p)?;
+                            tx.execute(
+                                "UPDATE secrets SET deleted_at=?1, path=?2 WHERE id=?3",
+                                params![now(), format!("{}#deleted#{}", s.path, s.id), s.id],
+                            )?;
+                            reseal_secret_row(&tx, k, &s.id)?;
+                        }
+                        a.require(Cap::Delete, &format!("{path}/x"))?;
+                        drop_folder_rows(&tx, path, None)?;
+                        inside.len()
+                    }
+                };
+                tx.commit()?;
+                Ok(n)
+            })
+        })();
+        let (o, d) = outcome(&r);
+        let detail = match (&r, move_to) {
+            (Ok(n), Some(dest)) => format!("{n} items moved to {}", if dest.is_empty() { "top level" } else { dest }),
+            (Ok(n), None) => format!("{n} items deleted"),
+            (Err(_), _) => d,
+        };
+        self.log(&a.label(), "folder.delete", path, o, &detail)?;
+        r
+    }
+
+    /// Move everything under `from` to sit under `to` ("" = top level).
+    fn rehome(&self, tx: &Connection, k: &Keys, a: &Actor, from: &str, to: &str) -> R<usize> {
+        let prefix = format!("{from}/");
+        let mut st = tx.prepare("SELECT path FROM secrets WHERE deleted_at IS NULL")?;
+        let inside: Vec<String> = st
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|p| p.starts_with(&prefix))
+            .collect();
+        drop(st);
+        for p in &inside {
+            let rest = &p[prefix.len()..];
+            let dest = if to.is_empty() { rest.to_string() } else { format!("{to}/{rest}") };
+            if !access::valid_path(&dest) {
+                return bad("the new location makes an item's address too long");
+            }
+            self.move_row(tx, k, a, p, &dest)?;
+        }
+        if inside.is_empty() {
+            // Nothing inside to check permissions against, so check the folder itself.
+            a.require(Cap::Delete, &format!("{from}/x"))?;
+            if !to.is_empty() {
+                a.require(Cap::Create, &format!("{to}/x"))?;
+            }
+        }
+        drop_folder_rows(tx, from, if to.is_empty() { None } else { Some(to) })?;
+        Ok(inside.len())
+    }
+
     pub fn set_driver(&self, a: &Actor, path: &str, driver: Option<Driver>) -> R<()> {
         let r = (|| {
             a.require_admin()?;
@@ -1109,6 +1325,34 @@ impl Vault {
         })();
         self.logged(a, if promote { "rotate.promote" } else { "rotate.discard" }, path, r)
     }
+}
+
+fn valid_folder(p: &str) -> bool {
+    access::valid_path(p) && p.len() <= 150
+}
+
+/// Remove the remembered-folder rows at and under `from`; with `to`, recreate
+/// them under the new location so empty sub-folders survive a rename.
+fn drop_folder_rows(tx: &Connection, from: &str, to: Option<&str>) -> R<()> {
+    let prefix = format!("{from}/");
+    let mut st = tx.prepare("SELECT path FROM folders")?;
+    let rows: Vec<String> = st
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|p| p == from || p.starts_with(&prefix))
+        .collect();
+    drop(st);
+    for p in rows {
+        tx.execute("DELETE FROM folders WHERE path=?1", params![p])?;
+        if let Some(to) = to {
+            let moved = format!("{to}{}", &p[from.len()..]);
+            if valid_folder(&moved) {
+                tx.execute("INSERT OR IGNORE INTO folders (path, created_at) VALUES (?1, ?2)", params![moved, now()])?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check_value(v: &str) -> R<()> {
@@ -1563,6 +1807,72 @@ mod tests {
         assert!(matches!(v.update(&a, "infra/x", None, Some(Zeroizing::new("i-know-this".into()))), Err(VErr::Forbidden)));
         let m = Meta { username: "svc".into(), ..Default::default() };
         assert_eq!(v.update(&a, "infra/x", Some(m), None).unwrap().meta.username, "svc");
+    }
+
+    #[test]
+    fn folders_move_rename_and_delete() {
+        let (v, root, _) = vault();
+        let val = |s: &str| Some(Zeroizing::new(s.to_string()));
+        v.create(&root, "personal/github", "password", Meta::default(), val("gh-password"), None).unwrap();
+        v.create(&root, "personal/banks/chase", "password", Meta::default(), val("chase-password"), None).unwrap();
+        v.create(&root, "work/vpn", "password", Meta::default(), val("vpn-password"), None).unwrap();
+        v.create_folder(&root, "business").unwrap();
+        v.create_folder(&root, "personal/empty-sub").unwrap();
+        let names = |v: &Vault| v.folders(&root).unwrap().into_iter().map(|f| format!("{}:{}", f.path, f.count)).collect::<Vec<_>>();
+        assert_eq!(names(&v), ["business:0", "personal:2", "personal/banks:1", "personal/empty-sub:0", "work:1"]);
+
+        // Move one item; its value and history come along.
+        v.move_secret(&root, "work/vpn", "business/vpn").unwrap();
+        assert_eq!(v.reveal(&root, "business/vpn", None).unwrap().as_str(), "vpn-password");
+        assert!(matches!(v.get(&root, "work/vpn"), Err(VErr::NotFound)));
+        assert!(matches!(v.move_secret(&root, "business/vpn", "personal/github"), Err(VErr::Conflict(_))));
+
+        // Rename a folder: sub-folders (even empty ones) follow.
+        assert_eq!(v.move_folder(&root, "personal", "home").unwrap(), 2);
+        assert_eq!(v.reveal(&root, "home/banks/chase", None).unwrap().as_str(), "chase-password");
+        assert_eq!(names(&v), ["business:1", "home:2", "home/banks:1", "home/empty-sub:0"]);
+        assert!(matches!(v.move_folder(&root, "home", "home/inner"), Err(VErr::BadRequest(_))));
+
+        // Delete a folder but keep its items by moving them elsewhere.
+        assert_eq!(v.delete_folder(&root, "home/banks", Some("business")).unwrap(), 1);
+        assert_eq!(v.reveal(&root, "business/chase", None).unwrap().as_str(), "chase-password");
+        // Delete a folder and everything in it.
+        assert_eq!(v.delete_folder(&root, "business", None).unwrap(), 2);
+        assert!(matches!(v.get(&root, "business/chase"), Err(VErr::NotFound)));
+        assert_eq!(names(&v), ["home:1", "home/empty-sub:0"]);
+        assert!(v.audit_verify(&root).unwrap().1.is_none());
+    }
+
+    #[test]
+    fn moving_respects_permissions_and_cannot_gain_reveal() {
+        let (v, root, _) = vault();
+        v.create(&root, "work/vpn", "password", Meta::default(), Some(Zeroizing::new("vpn-password".into())), None).unwrap();
+        v.create(&root, "infra/a", "password", Meta::default(), None, None).unwrap();
+        // Agent scoped to infra cannot pull a work item into its own area, or push one out.
+        let a = agent(&v, &root, vec![Cap::List, Cap::Create, Cap::Delete]);
+        assert!(matches!(v.move_secret(&a, "work/vpn", "infra/vpn"), Err(VErr::Forbidden)));
+        assert!(matches!(v.move_secret(&a, "infra/a", "work/a"), Err(VErr::Forbidden)));
+        assert!(matches!(v.move_folder(&a, "work", "infra/work"), Err(VErr::Forbidden)));
+        assert!(matches!(v.delete_folder(&a, "work", None), Err(VErr::Forbidden)));
+        v.move_secret(&a, "infra/a", "infra/sub/a").unwrap();
+        // A person who may delete in `work` and read values in `personal`
+        // must not be able to read work passwords by moving them over.
+        let (_, t) = v
+            .create_token(
+                &root,
+                "mover",
+                Role::Human,
+                vec![
+                    Rule { path: "work/**".into(), caps: vec![Cap::List, Cap::Delete] },
+                    Rule { path: "personal/**".into(), caps: vec![Cap::List, Cap::Create, Cap::Reveal] },
+                ],
+                None,
+            )
+            .unwrap();
+        let h = v.authenticate(&t).unwrap();
+        assert!(matches!(v.move_secret(&h, "work/vpn", "personal/vpn"), Err(VErr::Forbidden)));
+        assert!(matches!(v.move_folder(&h, "work", "personal/work"), Err(VErr::Forbidden)));
+        assert_eq!(v.reveal(&root, "work/vpn", None).unwrap().as_str(), "vpn-password");
     }
 
     #[test]

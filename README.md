@@ -91,6 +91,24 @@ Every item has a **path** (its unique address, used by access rules and
 agents, e.g. `infra/pve/root`) plus ordinary fields: name, website, username,
 tags, notes.
 
+### Folders
+
+In the web UI people work with folders (Personal, Work, Business…) and item
+names. Underneath, a folder is just a path prefix, so agents and access rules
+keep stable addresses like `personal/banks/chase`.
+
+```bash
+jaword folder ls
+jaword folder new business
+jaword mv work/vpn business/vpn
+jaword folder mv personal home             # rename, contents follow
+jaword folder rm old --move-to archive     # keep the items
+jaword folder rm old                       # delete folder and items
+```
+
+Moving needs `delete`+`list` at the source and `create` at the destination,
+and is refused if it would let the mover read values it could not read before.
+
 ### Import and export
 
 ```bash
@@ -141,6 +159,27 @@ python3 tests/pentest.py http://127.0.0.1:8212 init.json vault.db server.log
 
 Server configuration is by environment: `JAWORD_DB`, `JAWORD_LISTEN`,
 `JAWORD_ALLOWED_HOSTS` (see `deploy/jawordd.service`).
+
+## Updates
+
+The vault can update itself from signed GitHub releases, triggered from the
+web UI (Updates page), `jaword update apply vX.Y.Z`, or the MCP tool
+`vault_update_apply`.
+
+- `scripts/release.sh vX.Y.Z` builds, signs each artifact with an SSH signing
+  key (`ssh-keygen -Y sign`) and publishes a GitHub release.
+- The vault process only drops a request file. A separate root helper
+  (`deploy/jaword-updater`) downloads the release, verifies the signature
+  against `/etc/jaword/release_signers`, refuses downgrades, installs, and
+  rolls back if the new version does not start.
+- The signature covers the version and file name, so an old release cannot be
+  replayed as a new one.
+- No signers file means updates are off.
+- After an update the vault restarts **sealed**. A human unseals it.
+
+Whoever holds the release signing key can replace the vault's code. Keep it
+somewhere that needs a human approval per signature (for example the
+1Password SSH agent), not in a plain file an agent can read.
 
 ## Not built yet
 

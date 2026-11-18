@@ -40,6 +40,10 @@ pub enum Cap {
     /// Read plaintext. Never grantable to agent tokens.
     Reveal,
     Delete,
+    /// Ask the vault to check for or install a signed release. Granted on
+    /// the fixed path `sys/update`. The signature, not this capability, is
+    /// what decides whether code is accepted.
+    Upgrade,
 }
 
 impl Cap {
@@ -53,6 +57,7 @@ impl Cap {
             "rotate" => Cap::Rotate,
             "reveal" => Cap::Reveal,
             "delete" => Cap::Delete,
+            "upgrade" => Cap::Upgrade,
             _ => return None,
         })
     }

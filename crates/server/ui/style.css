@@ -80,6 +80,21 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); box-sha
 .panel a:hover { text-decoration: underline; }
 textarea.code { min-height: 190px; white-space: pre; }
 .item .m { color: var(--muted); font-size: 12px; margin-top: 2px; display: flex; gap: 8px; flex-wrap: wrap; }
+.split3 { display: grid; grid-template-columns: 190px minmax(230px, 320px) 1fr; gap: 14px; align-items: start; }
+.split3 > * { min-width: 0; }
+.tree { display: flex; flex-direction: column; gap: 2px; }
+.foldrow { display: flex; align-items: center; }
+.fold { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; background: none; border: 0; border-radius: 8px; padding: 7px 10px; color: var(--muted); cursor: pointer; text-align: left; }
+.fold .grow { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fold:hover, .fold.on { background: var(--panel-2); color: var(--text); }
+.fold.on { box-shadow: inset 2px 0 0 var(--accent); }
+.fold .cnt { font-size: 11.5px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.more { background: none; border: 0; color: var(--dim); cursor: pointer; padding: 4px 7px; border-radius: 6px; opacity: 0; }
+.foldrow:hover .more, .more:focus-visible { opacity: 1; }
+.more:hover { background: var(--panel-2); color: var(--text); }
+.danger-zone { margin-top: 18px; padding-top: 4px; border-top: 1px solid var(--line); }
+.danger-zone select { margin: 6px 0 2px; }
+.check input[type=radio] { width: auto; }
 .empty { color: var(--muted); padding: 28px 16px; text-align: center; }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r); padding: 18px; }
 .panel h3 { margin: 0 0 2px; font: 600 15px var(--mono); overflow-wrap: anywhere; }
@@ -133,6 +148,11 @@ dialog h3 { margin: 0 0 4px; font-size: 16px; }
   .side .foot b, .side .foot small { display: none; }
   .main { padding: 16px; }
   .split { grid-template-columns: 1fr; }
+  .split3 { grid-template-columns: 1fr; }
+  .tree { flex-direction: row; flex-wrap: wrap; }
+  .foldrow { flex: 0 0 auto; }
+  .fold { padding-left: 10px !important; }
+  .more { opacity: 1; }
   .two { grid-template-columns: 1fr; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }

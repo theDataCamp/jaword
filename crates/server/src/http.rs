@@ -33,13 +33,14 @@ const AUTH_FAILS_PER_MIN: u32 = 20;
 
 pub struct App {
     pub vault: Vault,
+    pub updater: crate::update::Updater,
     pub allowed_hosts: Vec<String>,
     fails: Mutex<HashMap<IpAddr, (u32, Instant)>>,
 }
 
 impl App {
     pub fn new(vault: Vault, allowed_hosts: Vec<String>) -> App {
-        App { vault, allowed_hosts, fails: Mutex::new(HashMap::new()) }
+        App { vault, updater: crate::update::Updater::from_env(), allowed_hosts, fails: Mutex::new(HashMap::new()) }
     }
 
     fn blocked(&self, ip: IpAddr) -> bool {
@@ -287,6 +288,33 @@ struct TokenReq {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct MoveReq {
+    path: String,
+    new_path: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FolderMoveReq {
+    from: String,
+    to: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FolderDeleteReq {
+    path: String,
+    /// Present = move the items there ("" for top level); absent = delete them.
+    #[serde(default)]
+    move_to: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateSysReq {
+    action: String,
+    #[serde(default)]
+    version: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RevokeReq {
     id: String,
 }
@@ -357,6 +385,20 @@ async fn passphrase(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap, Json(r):
     let a = actor(&app, &h, addr.ip())?;
     blocking(move || app.vault.change_passphrase(&a, &r.current, &r.new)).await?;
     Ok(Json(json!({"changed": true})))
+}
+
+async fn update_status(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap) -> Res {
+    let a = actor(&app, &h, addr.ip())?;
+    app.vault.authorize_upgrade(&a, "status")?;
+    Ok(Json(app.updater.status()))
+}
+
+async fn update_request(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap, Json(r): Json<UpdateSysReq>) -> Res {
+    let a = actor(&app, &h, addr.ip())?;
+    let detail: String = format!("{} {}", r.action, r.version.as_deref().unwrap_or("")).chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ' ')).take(40).collect();
+    app.vault.authorize_upgrade(&a, detail.trim())?;
+    app.updater.request(&r.action, r.version.as_deref()).map_err(VErr::BadRequest)?;
+    Ok(Json(json!({"requested": true})))
 }
 
 async fn whoami(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap) -> Res {
@@ -434,6 +476,34 @@ async fn driver(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap, Json(r): Jso
     Ok(Json(json!({"saved": true})))
 }
 
+async fn move_secret(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap, Json(r): Json<MoveReq>) -> Res {
+    let a = actor(&app, &h, addr.ip())?;
+    ok(app.vault.move_secret(&a, &r.path, &r.new_path)?)
+}
+
+async fn folders(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap) -> Res {
+    let a = actor(&app, &h, addr.ip())?;
+    ok(app.vault.folders(&a)?)
+}
+
+async fn folder_create(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap, Json(r): Json<PathReq>) -> Res {
+    let a = actor(&app, &h, addr.ip())?;
+    app.vault.create_folder(&a, &r.path)?;
+    Ok(Json(json!({"created": true})))
+}
+
+async fn folder_move(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap, Json(r): Json<FolderMoveReq>) -> Res {
+    let a = actor(&app, &h, addr.ip())?;
+    let n = app.vault.move_folder(&a, &r.from, &r.to)?;
+    Ok(Json(json!({"moved": n})))
+}
+
+async fn folder_delete(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap, Json(r): Json<FolderDeleteReq>) -> Res {
+    let a = actor(&app, &h, addr.ip())?;
+    let n = app.vault.delete_folder(&a, &r.path, r.move_to.as_deref())?;
+    Ok(Json(json!({"items": n, "moved": r.move_to.is_some()})))
+}
+
 async fn tokens(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap) -> Res {
     let a = actor(&app, &h, addr.ip())?;
     ok(app.vault.list_tokens(&a)?)
@@ -491,6 +561,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/sys/unseal", post(unseal))
         .route("/v1/sys/seal", post(seal))
         .route("/v1/sys/passphrase", post(passphrase))
+        .route("/v1/sys/update", get(update_status).post(update_request))
         .route("/v1/whoami", get(whoami))
         .route("/v1/secrets", get(list))
         .route("/v1/secrets/get", get(get_secret))
@@ -502,6 +573,11 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/secrets/reveal", post(reveal))
         .route("/v1/secrets/delete", post(delete))
         .route("/v1/secrets/driver", post(driver))
+        .route("/v1/secrets/move", post(move_secret))
+        .route("/v1/folders", get(folders))
+        .route("/v1/folders/create", post(folder_create))
+        .route("/v1/folders/move", post(folder_move))
+        .route("/v1/folders/delete", post(folder_delete))
         .route("/v1/tokens", get(tokens))
         .route("/v1/tokens/create", post(token_create))
         .route("/v1/tokens/revoke", post(token_revoke))

@@ -4,6 +4,7 @@
 mod drivers;
 mod http;
 mod store;
+mod update;
 
 use jaword_core::crypto::KdfParams;
 use axum::response::IntoResponse;
@@ -22,6 +23,17 @@ fn env(key: &str, default: &str) -> String {
 
 #[tokio::main]
 async fn main() {
+    // `--version` is used by the update helper to confirm what a binary is
+    // before and after installing it. Anything else is rejected rather than
+    // silently starting a server.
+    if let Some(arg) = std::env::args().nth(1) {
+        if arg == "--version" || arg == "-V" {
+            println!("jawordd {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        eprintln!("unknown argument {arg:?}; jawordd is configured through JAWORD_* environment variables");
+        std::process::exit(2);
+    }
     tracing_subscriber::fmt().with_target(false).init();
 
     let db_path = env("JAWORD_DB", "jaword.db");

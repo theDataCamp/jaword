@@ -87,6 +87,46 @@ fn tools() -> Value {
             }, "required": ["out"]}
         },
         {
+            "name": "secret_move",
+            "description": "Move or rename a secret to a new path (for example into another folder). History and rotation setup move with it.",
+            "inputSchema": {"type": "object", "properties": {"path": path, "new_path": {"type": "string", "description": "Destination path, e.g. business/vpn"}}, "required": ["path", "new_path"]}
+        },
+        {
+            "name": "folder_list",
+            "description": "List folders (path prefixes) with how many items each holds.",
+            "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
+            "name": "folder_create",
+            "description": "Create an empty folder, e.g. personal or work/clients.",
+            "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+        },
+        {
+            "name": "folder_move",
+            "description": "Rename or move a folder and everything inside it. Changes the path of every item in it.",
+            "inputSchema": {"type": "object", "properties": {"from": {"type": "string"}, "to": {"type": "string"}}, "required": ["from", "to"]}
+        },
+        {
+            "name": "folder_delete",
+            "description": "Delete a folder. With move_to its items are moved there first (empty string = top level). WITHOUT move_to every item inside is deleted: only do that when the user explicitly asked for the contents to be deleted.",
+            "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}, "move_to": {"type": "string"}}, "required": ["path"]}
+        },
+        {
+            "name": "vault_update_status",
+            "description": "Show the vault's installed version, the latest release it knows about and the result of the last update check or install. Needs `upgrade` on `sys/update`.",
+            "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
+            "name": "vault_update_check",
+            "description": "Ask the vault to look up the latest signed release. Read vault_update_status a few seconds later for the result.",
+            "inputSchema": {"type": "object", "properties": {}}
+        },
+        {
+            "name": "vault_update_apply",
+            "description": "Install a signed release on the vault. The vault verifies the signature itself; unsigned or tampered releases are refused. IMPORTANT: this restarts the vault, which then stays sealed (nothing can be read or rotated) until a human enters the passphrase. Only do this when the user asked for it.",
+            "inputSchema": {"type": "object", "properties": {"version": {"type": "string", "description": "Exact release tag, e.g. v0.2.0"}}, "required": ["version"]}
+        },
+        {
             "name": "secret_delete",
             "description": "Soft-delete a secret (an admin can still recover it).",
             "inputSchema": {"type": "object", "properties": {"path": path}, "required": ["path"]}
@@ -163,6 +203,20 @@ fn call(c: &Client, name: &str, args: &Value) -> Result<Value, ApiError> {
             true,
         )
         .map_err(|m| ApiError { status: 400, message: m }),
+        "secret_move" => c.post("/v1/secrets/move", &json!({"path": arg(args, "path")?, "new_path": arg(args, "new_path")?})),
+        "folder_list" => c.get("/v1/folders"),
+        "folder_create" => c.post("/v1/folders/create", &json!({"path": arg(args, "path")?})),
+        "folder_move" => c.post("/v1/folders/move", &json!({"from": arg(args, "from")?, "to": arg(args, "to")?})),
+        "folder_delete" => {
+            let mut body = json!({"path": arg(args, "path")?});
+            if let Some(m) = args["move_to"].as_str() {
+                body["move_to"] = json!(m);
+            }
+            c.post("/v1/folders/delete", &body)
+        }
+        "vault_update_status" => c.get("/v1/sys/update"),
+        "vault_update_check" => c.post("/v1/sys/update", &json!({"action": "check"})),
+        "vault_update_apply" => c.post("/v1/sys/update", &json!({"action": "apply", "version": arg(args, "version")?})),
         "secret_delete" => c.post("/v1/secrets/delete", &json!({"path": arg(args, "path")?})),
         _ => Err(ApiError { status: 404, message: format!("unknown tool `{name}`") }),
     }

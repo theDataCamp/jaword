@@ -5,7 +5,7 @@
 
 const REVEAL_SECONDS = 30;
 const IDLE_LOCK_MS = 10 * 60 * 1000;
-const state = { token: null, me: null, view: "secrets", secrets: [], selected: null, filter: "" };
+const state = { token: null, me: null, view: "secrets", secrets: [], folders: [], folder: "", selected: null, filter: "" };
 const root = document.getElementById("app");
 
 try { state.token = sessionStorage.getItem("jaword.token"); } catch (_) { /* storage blocked */ }
@@ -124,7 +124,7 @@ const isAdmin = () => state.me && state.me.role === "admin";
 
 function shell() {
   const views = [["secrets", "Secrets"]];
-  if (isAdmin()) views.push(["tokens", "Tokens"], ["audit", "Audit log"]);
+  if (isAdmin()) views.push(["tokens", "Tokens"], ["audit", "Audit log"], ["updates", "Updates"]);
   const main = h("main", { class: "main" });
   const nav = views.map(([id, label]) => h("button", { class: "nav" + (state.view === id ? " on" : ""), onclick: () => { state.view = id; shell(); } }, label));
   root.replaceChildren(h("div", { class: "shell" },
@@ -136,7 +136,7 @@ function shell() {
           h("button", { class: "btn small ghost", onclick: logout }, "Sign out"),
           isAdmin() && h("button", { class: "btn small ghost danger", onclick: sealVault }, "Seal")))),
     main));
-  ({ secrets: viewSecrets, tokens: viewTokens, audit: viewAudit })[state.view](main);
+  ({ secrets: viewSecrets, tokens: viewTokens, audit: viewAudit, updates: viewUpdates })[state.view](main);
 }
 
 async function sealVault() {
@@ -152,32 +152,66 @@ function fail(e) {
 
 // ---------------------------------------------------------------- secrets
 
+// Folders are path prefixes. People see "Personal / Banks"; agents and access
+// rules keep using the stable address personal/banks/chase.
+const pretty = (seg) => { const t = seg.replace(/[-_]+/g, " "); return t.charAt(0).toUpperCase() + t.slice(1); };
+const folderOf = (p) => { const i = p.lastIndexOf("/"); return i < 0 ? "" : p.slice(0, i); };
+const leafOf = (p) => p.slice(p.lastIndexOf("/") + 1);
+const folderLabel = (p) => (p ? p.split("/").map(pretty).join(" / ") : "No folder");
+const slug = (t) => t.toLowerCase().normalize("NFKD").replace(/[^a-z0-9._-]+/g, "-").replace(/\.{2,}/g, ".").replace(/^[^a-z0-9]+|[-.]+$/g, "").slice(0, 60);
+const itemName = (s) => s.meta.title || pretty(leafOf(s.path));
+
+function folderSelect(selected, opts) {
+  const o = opts || {};
+  const list = (state.folders || []).filter((f) => !o.exclude || (f.path !== o.exclude && !f.path.startsWith(o.exclude + "/")));
+  const sel = h("select", {},
+    h("option", { value: "", selected: selected === "" }, o.rootLabel || "No folder"),
+    list.map((f) => h("option", { value: f.path, selected: f.path === selected }, "  ".repeat(f.path.split("/").length - 1) + pretty(leafOf(f.path)))),
+    o.allowNew && h("option", { value: "\u0000new" }, "+ New folder…"));
+  return sel;
+}
+
 async function viewSecrets(main) {
+  const treeEl = h("nav", { class: "tree", "aria-label": "Folders" });
   const listEl = h("div", { class: "list" });
   const detailEl = h("div", {});
-  const search = h("input", { type: "search", placeholder: "Search name, path, site, user or tag", value: state.filter, "aria-label": "Filter secrets",
+  const search = h("input", { type: "search", placeholder: "Search name, site, user or tag", value: state.filter, "aria-label": "Search",
     oninput: (e) => { state.filter = e.target.value; renderList(); } });
   main.replaceChildren(
     h("div", { class: "head" }, h("h2", {}, "Secrets"), h("div", { class: "grow" }, search),
-      h("button", { class: "btn primary", onclick: () => secretDialog(null, reload) }, "New secret")),
-    h("div", { class: "split" }, listEl, detailEl));
+      h("button", { class: "btn", onclick: () => folderDialog(null, reload) }, "New folder"),
+      h("button", { class: "btn primary", onclick: () => secretDialog(null, reload) }, "New item")),
+    h("div", { class: "split3" }, treeEl, listEl, detailEl));
+
+  const pick = (f) => { state.folder = f; renderTree(); renderList(); };
+
+  function renderTree() {
+    const all = h("button", { class: "fold" + (!state.folder ? " on" : ""), onclick: () => pick("") }, h("span", { class: "grow" }, "All items"), h("span", { class: "cnt" }, state.secrets.length));
+    const rows = state.folders.map((f) => {
+      const b = h("button", { class: "fold" + (state.folder === f.path ? " on" : ""), onclick: () => pick(f.path), title: f.path },
+        h("span", { class: "grow" }, pretty(leafOf(f.path))), h("span", { class: "cnt" }, f.count));
+      b.style.paddingLeft = 10 + (f.path.split("/").length - 1) * 14 + "px";
+      return h("div", { class: "foldrow" }, b,
+        h("button", { class: "more", title: "Rename, move or delete", "aria-label": "Options for folder " + folderLabel(f.path), onclick: () => folderDialog(f, reload) }, "⋯"));
+    });
+    treeEl.replaceChildren(all, ...rows);
+  }
 
   function renderList() {
     const q = state.filter.trim().toLowerCase();
-    const rows = state.secrets.filter((s) => !q || s.path.includes(q) || (s.meta.title || "").toLowerCase().includes(q) || s.meta.url.toLowerCase().includes(q) || s.meta.username.toLowerCase().includes(q) || s.meta.tags.some((t) => t.toLowerCase().includes(q)));
-    if (!rows.length) return listEl.replaceChildren(h("div", { class: "empty" }, state.secrets.length ? "Nothing matches." : "No secrets yet."));
-    listEl.replaceChildren(...rows.map((s) => {
-      const i = s.path.lastIndexOf("/");
-      return h("button", { class: "item" + (state.selected === s.path ? " on" : ""), onclick: () => { state.selected = s.path; renderList(); renderDetail(); } },
-        s.meta.title && h("div", { class: "ttl" }, s.meta.title),
-        h("div", { class: "p" }, h("span", { class: "dir" }, s.path.slice(0, i + 1)), s.path.slice(i + 1)),
-        h("div", { class: "m" }, h("span", {}, s.kind), h("span", {}, "v" + s.current_version), s.meta.username && h("span", {}, s.meta.username),
-          s.has_driver && h("span", { class: "pill" }, "auto-rotate"), s.pending_rotation && h("span", { class: "pill pending" }, "pending")));
-    }));
+    const inFolder = (s) => !state.folder || s.path.startsWith(state.folder + "/");
+    const hit = (s) => !q || s.path.includes(q) || (s.meta.title || "").toLowerCase().includes(q) || s.meta.url.toLowerCase().includes(q) || s.meta.username.toLowerCase().includes(q) || s.meta.tags.some((t) => t.toLowerCase().includes(q));
+    const rows = state.secrets.filter((s) => inFolder(s) && hit(s));
+    if (!rows.length) return listEl.replaceChildren(h("div", { class: "empty" }, state.secrets.length ? (q ? "Nothing matches." : "This folder is empty.") : "Nothing here yet. Create an item or import from another password manager."));
+    listEl.replaceChildren(...rows.map((s) =>
+      h("button", { class: "item" + (state.selected === s.path ? " on" : ""), onclick: () => { state.selected = s.path; renderList(); renderDetail(); } },
+        h("div", { class: "ttl" }, itemName(s)),
+        h("div", { class: "m" }, s.meta.username && h("span", {}, s.meta.username), h("span", {}, folderLabel(folderOf(s.path))),
+          s.has_driver && h("span", { class: "pill" }, "auto-rotate"), s.pending_rotation && h("span", { class: "pill pending" }, "pending")))));
   }
 
   async function renderDetail() {
-    if (!state.selected) return detailEl.replaceChildren(h("div", { class: "panel empty" }, "Select a secret to see its history."));
+    if (!state.selected) return detailEl.replaceChildren(h("div", { class: "panel empty" }, "Select an item to see it."));
     let d;
     try { d = await api("GET", "/v1/secrets/get?path=" + encodeURIComponent(state.selected)); }
     catch (e) { state.selected = null; return fail(e); }
@@ -185,9 +219,10 @@ async function viewSecrets(main) {
   }
 
   async function reload() {
-    try { state.secrets = await api("GET", "/v1/secrets"); } catch (e) { return fail(e); }
+    try { [state.secrets, state.folders] = await Promise.all([api("GET", "/v1/secrets"), api("GET", "/v1/folders")]); } catch (e) { return fail(e); }
     if (state.selected && !state.secrets.some((s) => s.path === state.selected)) state.selected = null;
-    renderList(); renderDetail();
+    if (state.folder && !state.folders.some((f) => f.path === state.folder)) state.folder = "";
+    renderTree(); renderList(); renderDetail();
   }
   reload();
 }
@@ -227,8 +262,8 @@ function secretPanel(d, reload) {
   }
   const m = d.meta;
   return h("div", { class: "panel" },
-    h("h3", { class: m.title ? "plain" : null }, m.title || d.path),
-    m.title && h("div", { class: "hint mono" }, d.path),
+    h("h3", { class: "plain" }, m.title || pretty(leafOf(d.path))),
+    h("div", { class: "hint" }, folderLabel(folderOf(d.path))),
     h("div", { class: "row" }, h("span", { class: "pill" }, d.kind), h("span", { class: "pill current" }, "v" + d.current_version),
       d.has_driver && h("span", { class: "pill" }, "auto-rotate"), d.pending_rotation && h("span", { class: "pill pending" }, "rotation pending")),
     h("div", { class: "secretbox" }, val,
@@ -241,11 +276,13 @@ function secretPanel(d, reload) {
       h("dt", {}, "Tags"), h("dd", {}, m.tags.length ? m.tags.map((t) => h("span", { class: "pill" }, t)) : "—"),
       h("dt", {}, "Notes"), h("dd", {}, m.notes || "—"),
       h("dt", {}, "Updated"), h("dd", {}, fmt(d.updated_at)),
+      h("dt", {}, "Address"), h("dd", { class: "mono", title: "What agents and access rules use to refer to this item" }, d.path),
       d.driver && h("dt", {}, "Driver"), d.driver && h("dd", { class: "mono" }, d.driver.type === "ssh" ? `ssh ${d.driver.user}@${d.driver.host}: ${d.driver.command}` : d.driver.argv.join(" "))),
     h("div", { class: "row" },
       d.has_driver && h("button", { class: "btn primary", onclick: () => confirm(`Rotate ${d.path} on the live system now?`) && act("rotate", "/v1/secrets/rotate", { path: d.path }, "Rotated") }, "Rotate now"),
       h("button", { class: "btn", onclick: () => confirm("Generate a new value in the vault only? The live system is not changed.") && act("gen", "/v1/secrets/generate", { path: d.path }, "New version generated") }, "Generate new version"),
       h("button", { class: "btn", onclick: () => secretDialog(d, reload) }, "Edit"),
+      h("button", { class: "btn", onclick: () => moveDialog(d, reload) }, "Move"),
       isAdmin() && h("button", { class: "btn", onclick: () => driverDialog(d, reload) }, d.has_driver ? "Rotation setup" : "Set up rotation"),
       d.pending_rotation && isAdmin() && h("button", { class: "btn", onclick: () => confirm("Promote the pending version to current?") && act("res", "/v1/secrets/resolve", { path: d.path, promote: true }, "Promoted") }, "Promote pending"),
       d.pending_rotation && isAdmin() && h("button", { class: "btn", onclick: () => confirm("Discard the pending version?") && act("res", "/v1/secrets/resolve", { path: d.path, promote: false }, "Discarded") }, "Discard pending"),
@@ -261,28 +298,39 @@ function secretPanel(d, reload) {
 
 function secretDialog(existing, done) {
   const m = existing ? existing.meta : { title: "", username: "", url: "", notes: "", tags: [] };
-  const slug = (t) => t.toLowerCase().normalize("NFKD").replace(/[^a-z0-9._-]+/g, "-").replace(/^[^a-z0-9]+|-+$/g, "").slice(0, 60);
-  let pathTouched = !!existing;
   const f = {
-    title: h("input", { type: "text", placeholder: "Proxmox root login", value: m.title || "", autocomplete: "off", maxlength: "200", autofocus: true }),
-    path: h("input", { type: "text", placeholder: "infra/pve/root", value: existing ? existing.path : "", disabled: !!existing, required: true, spellcheck: "false", autocomplete: "off" }),
-    kind: h("select", { disabled: !!existing }, ["password", "api_key", "ssh_key", "config", "note"].map((k) => h("option", { value: k, selected: existing && existing.kind === k }, k))),
+    title: h("input", { type: "text", placeholder: "GitHub, Chase Bank, Proxmox root…", value: m.title || "", autocomplete: "off", maxlength: "200", autofocus: true, required: !existing }),
+    folder: folderSelect(state.folder || "", { allowNew: true }),
+    newFolder: h("input", { type: "text", placeholder: "New folder name", autocomplete: "off" }),
+    kind: h("select", {}, [["password", "Login / password"], ["api_key", "API key"], ["ssh_key", "SSH key"], ["config", "Configuration"], ["note", "Secure note"]].map(([k, l]) => h("option", { value: k }, l))),
     username: h("input", { type: "text", value: m.username, autocomplete: "off" }),
     url: h("input", { type: "text", value: m.url, placeholder: "https://…", autocomplete: "off" }),
     tags: h("input", { type: "text", value: m.tags.join(", "), placeholder: "comma separated", autocomplete: "off" }),
     notes: h("textarea", {}, m.notes),
     own: h("input", { type: "checkbox" }),
-    value: h("input", { type: "password", autocomplete: "new-password", placeholder: existing ? "leave empty to keep current value" : "your value" }),
+    value: h("input", { type: "password", autocomplete: "new-password", placeholder: existing ? "leave empty to keep the current one" : "your password" }),
     length: h("input", { type: "number", min: "12", max: "256", value: "32" }),
     symbols: h("input", { type: "checkbox", checked: true }),
   };
   const err = h("div", { class: "error" });
-  const valueRow = h("div", { hidden: !existing }, h("label", {}, existing ? "New value (optional)" : "Value"), f.value);
+  const addr = h("p", { class: "hint mono" });
+  const newFolderRow = h("div", { hidden: true }, h("label", {}, "New folder name"), f.newFolder);
+  const valueRow = h("div", { hidden: !existing }, h("label", {}, existing ? "Replace password (optional)" : "Password"), f.value);
   const genRow = h("div", { class: "two", hidden: !!existing },
     h("div", {}, h("label", {}, "Length"), f.length), h("label", { class: "check" }, f.symbols, "Include symbols"));
-  f.own.addEventListener("change", () => { valueRow.hidden = !f.own.checked; genRow.hidden = f.own.checked; });
-  f.path.addEventListener("input", () => { pathTouched = true; });
-  f.title.addEventListener("input", () => { if (!pathTouched) f.path.value = (f.kind.value === "password" ? "logins/" : "infra/") + slug(f.title.value); });
+  const target = () => {
+    const folder = f.folder.value === "\u0000new" ? slug(f.newFolder.value) : f.folder.value;
+    const leaf = slug(f.title.value) || "item";
+    return (folder ? folder + "/" : "") + leaf;
+  };
+  const sync = () => {
+    newFolderRow.hidden = f.folder.value !== "\u0000new";
+    valueRow.hidden = existing ? false : !f.own.checked;
+    genRow.hidden = existing ? true : f.own.checked;
+    if (!existing) addr.textContent = "Address for agents and access rules: " + target();
+  };
+  [f.title, f.newFolder].forEach((el) => el.addEventListener("input", sync));
+  [f.folder, f.own].forEach((el) => el.addEventListener("change", sync));
   const dlg = h("dialog", {},
     h("form", { onsubmit: async (e) => {
       e.preventDefault(); err.textContent = "";
@@ -294,25 +342,101 @@ function secretDialog(existing, done) {
           if (f.value.value) body.value = f.value.value;
           await api("POST", "/v1/secrets/update", body);
         } else {
-          const body = { path: f.path.value.trim(), kind: f.kind.value, meta };
+          if (f.folder.value === "\u0000new" && !slug(f.newFolder.value)) { err.textContent = "Give the new folder a name."; return; }
+          const body = { path: target(), kind: f.kind.value, meta };
           if (f.own.checked) body.value = f.value.value;
           else body.policy = { type: "password", length: Number(f.length.value), symbols: f.symbols.checked ? null : "" };
           await api("POST", "/v1/secrets/create", body);
           state.selected = body.path;
         }
-        dlg.close(); dlg.remove(); toast(existing ? "Saved" : "Created"); done();
-      } catch (ex) { err.textContent = ex.message; }
+        dlg.close(); toast(existing ? "Saved" : "Created"); done();
+      } catch (ex) { err.textContent = ex.status === 409 ? "An item with that name already exists in this folder." : ex.message; }
     } },
-      h("h3", {}, existing ? "Edit secret" : "New secret"),
+      h("h3", {}, existing ? "Edit item" : "New item"),
       h("label", {}, "Name"), f.title,
+      !existing && h("div", { class: "two" }, h("div", {}, h("label", {}, "Folder"), f.folder), h("div", {}, h("label", {}, "Type"), f.kind)),
+      !existing && newFolderRow,
       h("div", { class: "two" }, h("div", {}, h("label", {}, "Username"), f.username), h("div", {}, h("label", {}, "Website"), f.url)),
-      h("div", { class: "two" }, h("div", {}, h("label", {}, "Path"), f.path), h("div", {}, h("label", {}, "Kind"), f.kind)),
-      !existing && h("p", { class: "hint" }, "The path is this item's unique address, like a folder and file name. Agents and access rules refer to it (for example: allow rotate on infra/**)."),
       h("label", {}, "Tags"), f.tags, h("label", {}, "Notes"), f.notes,
-      !existing && h("label", { class: "check" }, f.own, "I'll provide the value (otherwise the vault generates it)"),
-      genRow, valueRow, err,
-      h("div", { class: "row", style: null }, h("button", { class: "btn primary", type: "submit" }, existing ? "Save" : "Create"),
-        h("button", { class: "btn ghost", type: "button", onclick: () => { dlg.close(); dlg.remove(); } }, "Cancel"))));
+      !existing && h("label", { class: "check" }, f.own, "I'll type the password myself (otherwise a strong one is generated)"),
+      genRow, valueRow, !existing && addr, err,
+      h("div", { class: "row" }, h("button", { class: "btn primary", type: "submit" }, existing ? "Save" : "Create"),
+        h("button", { class: "btn ghost", type: "button", onclick: () => dlg.close() }, "Cancel"))));
+  document.body.append(dlg);
+  dlg.addEventListener("close", () => dlg.remove());
+  sync();
+  dlg.showModal();
+}
+
+function moveDialog(d, done) {
+  const sel = folderSelect(folderOf(d.path));
+  const err = h("div", { class: "error" });
+  const dlg = h("dialog", {},
+    h("form", { onsubmit: async (e) => {
+      e.preventDefault(); err.textContent = "";
+      const np = (sel.value ? sel.value + "/" : "") + leafOf(d.path);
+      if (np === d.path) return dlg.close();
+      try { await api("POST", "/v1/secrets/move", { path: d.path, new_path: np }); state.selected = np; dlg.close(); toast("Moved to " + folderLabel(sel.value)); done(); }
+      catch (ex) { err.textContent = ex.status === 409 ? "That folder already has an item with this name." : ex.message; }
+    } },
+      h("h3", {}, "Move “" + (d.meta.title || pretty(leafOf(d.path))) + "”"),
+      h("p", { class: "hint" }, "History and rotation setup move with it. Its address changes, so anything that refers to the old address must be updated."),
+      h("label", {}, "Move to folder"), sel, err,
+      h("div", { class: "row" }, h("button", { class: "btn primary", type: "submit" }, "Move"),
+        h("button", { class: "btn ghost", type: "button", onclick: () => dlg.close() }, "Cancel"))));
+  document.body.append(dlg);
+  dlg.addEventListener("close", () => dlg.remove());
+  dlg.showModal();
+}
+
+function folderDialog(folder, done) {
+  const err = h("div", { class: "error" });
+  const name = h("input", { type: "text", value: folder ? pretty(leafOf(folder.path)) : "", placeholder: "Personal, Work, Business…", autocomplete: "off", required: true, autofocus: true });
+  const parent = folderSelect(folder ? folderOf(folder.path) : state.folder || "", { exclude: folder && folder.path, rootLabel: "Top level" });
+  const dest = () => { const leaf = slug(name.value); return leaf ? (parent.value ? parent.value + "/" : "") + leaf : ""; };
+  const finish = (msg, sel) => { if (sel !== undefined) state.folder = sel; dlg.close(); toast(msg); done(); };
+  async function save(e) {
+    e.preventDefault(); err.textContent = "";
+    const to = dest();
+    if (!to) { err.textContent = "Use letters or numbers in the name."; return; }
+    try {
+      if (!folder) { await api("POST", "/v1/folders/create", { path: to }); return finish("Folder created", to); }
+      if (to === folder.path) return dlg.close();
+      await api("POST", "/v1/folders/move", { from: folder.path, to });
+      finish("Folder updated", to);
+    } catch (ex) { err.textContent = ex.status === 409 ? "Some items would collide with ones already there: " + ex.message : ex.message; }
+  }
+  let removal = null;
+  if (folder) {
+    const keep = h("input", { type: "radio", name: "what", checked: true });
+    const drop = h("input", { type: "radio", name: "what" });
+    const where = folderSelect(folderOf(folder.path), { exclude: folder.path, rootLabel: "Top level (no folder)" });
+    const n = folder.count;
+    removal = h("div", { class: "danger-zone" },
+      h("h4", {}, "Delete this folder"),
+      n === 0 ? h("p", { class: "hint" }, "This folder is empty.")
+        : h("div", {},
+            h("p", { class: "hint" }, `It contains ${n} item${n === 1 ? "" : "s"}, including any in sub-folders. What should happen to ${n === 1 ? "it" : "them"}?`),
+            h("label", { class: "check" }, keep, "Move " + (n === 1 ? "it" : "them") + " to"), where,
+            h("label", { class: "check" }, drop, `Delete ${n === 1 ? "it" : "all " + n} as well`)),
+      h("div", { class: "row" }, h("button", { class: "btn danger", type: "button", onclick: async () => {
+        err.textContent = "";
+        const wipe = n > 0 && drop.checked;
+        if (wipe && !confirm(`Delete the folder “${folderLabel(folder.path)}” and the ${n} item${n === 1 ? "" : "s"} in it?`)) return;
+        const body = { path: folder.path };
+        if (!wipe) body.move_to = n === 0 ? folderOf(folder.path) : where.value;
+        try { await api("POST", "/v1/folders/delete", body); finish(wipe ? "Folder and items deleted" : "Folder deleted", ""); }
+        catch (ex) { err.textContent = ex.status === 409 ? "The destination already has an item with the same name: " + ex.message : ex.message; }
+      } }, "Delete folder")));
+  }
+  const dlg = h("dialog", {},
+    h("form", { onsubmit: save },
+      h("h3", {}, folder ? "Folder: " + folderLabel(folder.path) : "New folder"),
+      h("div", { class: "two" }, h("div", {}, h("label", {}, "Name"), name), h("div", {}, h("label", {}, "Inside"), parent)),
+      folder && h("p", { class: "hint" }, "Renaming or moving a folder changes the address of everything in it."),
+      h("div", { class: "row" }, h("button", { class: "btn primary", type: "submit" }, folder ? "Save" : "Create"),
+        h("button", { class: "btn ghost", type: "button", onclick: () => dlg.close() }, "Cancel")),
+      removal, err));
   document.body.append(dlg);
   dlg.addEventListener("close", () => dlg.remove());
   dlg.showModal();
@@ -376,7 +500,7 @@ async function viewTokens(main) {
 }
 
 function tokenDialog(done) {
-  const caps = ["list", "create", "update", "generate", "rotate", "delete", "write", "reveal"];
+  const caps = ["list", "create", "update", "generate", "rotate", "delete", "write", "reveal", "upgrade"];
   const name = h("input", { type: "text", placeholder: "claude-homelab", required: true, pattern: "[A-Za-z0-9._\\-]{1,64}", autocomplete: "off" });
   const role = h("select", {}, ["agent", "human", "admin"].map((r) => h("option", { value: r }, r)));
   const path = h("input", { type: "text", value: "infra/**", spellcheck: "false", autocomplete: "off" });
@@ -450,6 +574,42 @@ async function viewAudit(main) {
       h("td", { class: "mono" }, r.path), h("td", {}, h("span", { class: "pill " + r.outcome }, r.outcome)), h("td", {}, r.detail))));
   }
   load(true); verify();
+}
+
+// ---------------------------------------------------------------- updates
+
+async function viewUpdates(main) {
+  const box = h("div", { class: "panel" });
+  main.replaceChildren(h("div", { class: "head" }, h("h2", {}, "Updates")), box);
+  let timer;
+  const busy = (s) => ["checking", "downloading", "installing"].includes(s);
+  async function send(body) {
+    try { await api("POST", "/v1/sys/update", body); toast("Requested"); setTimeout(load, 1500); } catch (e) { fail(e); }
+  }
+  async function load() {
+    clearTimeout(timer);
+    if (state.view !== "updates" || !box.isConnected) return;
+    let s;
+    try { s = await api("GET", "/v1/sys/update"); }
+    catch (e) { if (e.status) return fail(e); timer = setTimeout(load, 2000); return box.replaceChildren(h("p", { class: "hint" }, "Vault is restarting…")); }
+    const hp = s.helper || {};
+    const latest = hp.latest || "";
+    const newer = latest && latest !== s.current;
+    box.replaceChildren(
+      h("dl", { class: "kv" },
+        h("dt", {}, "Installed"), h("dd", { class: "mono" }, s.current),
+        h("dt", {}, "Latest"), h("dd", { class: "mono" }, latest || "not checked yet"),
+        h("dt", {}, "Status"), h("dd", {}, hp.state ? h("span", { class: "pill " + (hp.state === "failed" ? "failed" : hp.state === "ok" ? "ok" : busy(hp.state) ? "pending" : "") }, hp.state) : "—", hp.message ? " " + hp.message : ""),
+        h("dt", {}, "Last run"), h("dd", {}, hp.ts ? fmt(hp.ts) : "—")),
+      s.enabled
+        ? h("div", { class: "row" },
+            h("button", { class: "btn", disabled: busy(hp.state), onclick: () => send({ action: "check" }) }, "Check for updates"),
+            newer && h("button", { class: "btn primary", disabled: busy(hp.state), onclick: () => confirm(`Install ${latest}? The vault will restart and stay sealed until you enter the passphrase.`) && send({ action: "apply", version: latest }) }, "Install " + latest))
+        : h("p", { class: "error" }, "Updates are disabled: no release signing key is installed on the vault host."),
+      h("p", { class: "hint" }, "Only releases signed with your release key are accepted. The signature is checked by a separate root helper, not by the vault itself, and a version that fails to start is rolled back automatically."));
+    if (busy(hp.state) || s.pending_request) timer = setTimeout(load, 1500);
+  }
+  load();
 }
 
 boot();
