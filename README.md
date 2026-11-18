@@ -127,20 +127,39 @@ by nature, so it needs a token with `reveal`.
 After a reboot of the container: open the web UI and enter the passphrase, or
 run `jaword unseal`.
 
-### Rotation drivers (admin only)
+### Setting up rotation (admin only)
+
+In the web UI, open an item and choose **Set up rotation**. Four steps, no
+configuration files:
+
+1. **How**: a user on a server (over SSH), or your own script.
+2. **Where**: the server and the account whose password changes.
+3. **Check**: the vault shows the server's fingerprint for you to confirm,
+   gives you a short script to run once on that server, then tests the whole
+   path without changing anything.
+4. **Schedule**: only when asked, or every 30 days, 90 days or year.
+
+The script in step 3 lets the vault's key run one helper on the server, and
+that helper only sets passwords for accounts listed in
+`/etc/jaword-rotate/accounts`. No shell, no other accounts.
+
+Scheduled rotations run inside the vault and pause while it is sealed. A
+failed one keeps the old password and is retried the next day.
+
+From the CLI the same setup is a JSON file:
 
 ```json
 {"type": "ssh", "host": "hypervisor-1", "user": "root",
- "command": "chpasswd", "stdin": "{{username}}:{{new}}\n"}
+ "command": "chpasswd", "stdin": "svc-backup:{{new}}\n", "every_days": 90}
 ```
 
 ```bash
-jaword driver home-lab/proxmox-root --file driver.json
+jaword driver home-lab/backup-user --file setup.json
 ```
 
 `{{new}}`, `{{old}}`, `{{username}}` are allowed in `stdin` only, never in the
-command line. The SSH driver uses key auth with strict host key checking, as
-the `jaword` user inside the container (`/var/lib/jaword/.ssh`).
+command line. The vault uses its own SSH key and only host keys you have
+confirmed (`/var/lib/jaword/.ssh`).
 
 ## Build, test, deploy
 

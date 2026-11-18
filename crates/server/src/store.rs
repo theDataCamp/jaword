@@ -23,7 +23,7 @@ use std::sync::{Mutex, MutexGuard, RwLock, TryLockError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
-use crate::drivers::Driver;
+use crate::drivers::{Driver, RotationSetup};
 
 pub const MAX_VALUE: usize = 16 * 1024;
 pub const MIN_PASSPHRASE: usize = 14;
@@ -185,6 +185,8 @@ pub struct SecretView {
     /// When the current value was set (not when metadata last changed), and by whom.
     pub changed_at: i64,
     pub changed_by: String,
+    /// Set when the vault rotates this on its own.
+    pub rotate_every_days: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -208,7 +210,7 @@ pub struct SecretDetail {
     pub secret: SecretView,
     pub versions: Vec<VersionView>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub driver: Option<Driver>,
+    pub driver: Option<RotationSetup>,
 }
 
 #[derive(Debug, Serialize)]
@@ -529,6 +531,62 @@ impl Vault {
         Ok(())
     }
 
+    /// Admin-only actions that have no item of their own (rotation setup helpers).
+    pub fn authorize_admin(&self, a: &Actor, action: &str, detail: &str) -> R<()> {
+        let r = a.require_admin();
+        let (o, _) = outcome(&r);
+        self.log(&a.label(), action, "", o, detail)?;
+        r
+    }
+
+    /// The identity scheduled rotations run under. Not a token: it exists
+    /// only inside the server and cannot be presented from outside.
+    pub fn schedule_actor() -> Actor {
+        Actor { token_id: "vault".into(), name: "schedule".into(), role: Role::Admin, rules: Vec::new() }
+    }
+
+    /// Items whose schedule says they are due. Skips anything with a rotation
+    /// in flight, and anything whose last attempt failed within a day, so a
+    /// broken target is retried daily rather than hammered.
+    pub fn due_rotations(&self) -> R<Vec<String>> {
+        self.with_keys(|k| {
+            let db = self.db();
+            let mut st = db.prepare(
+                "SELECT id,path,kind,current_version,created_at,updated_at,meta_blob,driver_blob,row_mac
+                 FROM secrets WHERE deleted_at IS NULL AND driver_blob IS NOT NULL",
+            )?;
+            let rows = st.query_map([], row_to_secret)?.collect::<Result<Vec<_>, _>>()?;
+            let t = now();
+            let mut due = Vec::new();
+            for s in rows {
+                if verify_secret_row(k, &s).is_err() {
+                    continue;
+                }
+                let blob = s.driver_blob.as_ref().expect("filtered by the query");
+                let Ok(plain) = crypto::open(&k.meta, &aad_driver(&s.id), blob) else { continue };
+                let Some(days) = serde_json::from_slice::<RotationSetup>(&plain).ok().and_then(|r| r.every_days) else { continue };
+                let changed: i64 = db.query_row(
+                    "SELECT created_at FROM versions WHERE secret_id=?1 AND version=?2",
+                    params![s.id, s.current_version],
+                    |r| r.get(0),
+                )?;
+                if t - changed < days as i64 * 86400 {
+                    continue;
+                }
+                let (state, at): (String, i64) = db.query_row(
+                    "SELECT state, created_at FROM versions WHERE secret_id=?1 ORDER BY version DESC LIMIT 1",
+                    params![s.id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                if state == "pending" || (state == "failed" && t - at < 86400) {
+                    continue;
+                }
+                due.push(s.path);
+            }
+            Ok(due)
+        })
+    }
+
     /// Gate and audit a self-update request. Admins, or tokens holding
     /// `upgrade` on `sys/update`.
     pub fn authorize_upgrade(&self, a: &Actor, detail: &str) -> R<()> {
@@ -806,6 +864,10 @@ impl Vault {
             pending_rotation: pending > 0,
             changed_at,
             changed_by,
+            rotate_every_days: match &s.driver_blob {
+                Some(b) => serde_json::from_slice::<RotationSetup>(&crypto::open(&k.meta, &aad_driver(&s.id), b)?)?.every_days,
+                None => None,
+            },
         })
     }
 
@@ -1218,7 +1280,7 @@ impl Vault {
         Ok(inside.len())
     }
 
-    pub fn set_driver(&self, a: &Actor, path: &str, driver: Option<Driver>) -> R<()> {
+    pub fn set_driver(&self, a: &Actor, path: &str, driver: Option<RotationSetup>) -> R<()> {
         let r = (|| {
             a.require_admin()?;
             if !access::valid_path(path) {
@@ -1256,7 +1318,7 @@ impl Vault {
                     .driver_blob
                     .as_ref()
                     .ok_or_else(|| VErr::BadRequest("no rotation driver configured for this secret".into()))?;
-                let driver: Driver = serde_json::from_slice(&crypto::open(&k.meta, &aad_driver(&s.id), blob)?)?;
+                let driver: Driver = serde_json::from_slice::<RotationSetup>(&crypto::open(&k.meta, &aad_driver(&s.id), blob)?)?.driver;
                 let pending: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM versions WHERE secret_id=?1 AND state='pending'",
                     params![s.id],
@@ -1733,7 +1795,7 @@ mod tests {
         let a = agent(&v, &root, vec![Cap::Rotate, Cap::List]);
         assert!(matches!(v.rotate_prepare(&a, "infra/r"), Err(VErr::BadRequest(_))));
         let d = Driver::Exec { argv: vec!["/usr/bin/true".into()], stdin: "{{new}}".into(), timeout_secs: 5 };
-        v.set_driver(&root, "infra/r", Some(d)).unwrap();
+        v.set_driver(&root, "infra/r", Some(d.into())).unwrap();
 
         let job = v.rotate_prepare(&a, "infra/r").unwrap();
         assert_eq!(job.old_value.as_str(), "original-pw");
@@ -1892,6 +1954,43 @@ mod tests {
         assert!(matches!(v.move_secret(&h, "work/vpn", "personal/vpn"), Err(VErr::Forbidden)));
         assert!(matches!(v.move_folder(&h, "work", "personal/work"), Err(VErr::Forbidden)));
         assert_eq!(v.reveal(&root, "work/vpn", None).unwrap().as_str(), "vpn-password");
+    }
+
+    #[test]
+    fn scheduled_rotations_come_due_and_back_off() {
+        let (v, root, _) = vault();
+        let val = |s: &str| Some(Zeroizing::new(s.to_string()));
+        let drv = |days| RotationSetup { driver: Driver::Exec { argv: vec!["/usr/bin/true".into()], stdin: "{{new}}".into(), timeout_secs: 5 }, every_days: days };
+        for p in ["a/fresh", "a/old", "a/manual", "a/none"] {
+            v.create(&root, p, "password", Meta::default(), val("starting-value"), None).unwrap();
+        }
+        v.set_driver(&root, "a/fresh", Some(drv(Some(90)))).unwrap();
+        v.set_driver(&root, "a/old", Some(drv(Some(90)))).unwrap();
+        v.set_driver(&root, "a/manual", Some(drv(None))).unwrap();
+        assert_eq!(v.list(&root, "a/old").unwrap()[0].rotate_every_days, Some(90));
+        assert!(v.due_rotations().unwrap().is_empty());
+        let age = |path: &str, days: i64| {
+            v.db().execute("UPDATE versions SET created_at=?1 WHERE secret_id=(SELECT id FROM secrets WHERE path=?2)", params![now() - days * 86400, path]).unwrap();
+        };
+        age("a/old", 91);
+        age("a/manual", 400);
+        age("a/none", 400);
+        assert_eq!(v.due_rotations().unwrap(), vec!["a/old"]);
+        // A failed attempt today is not retried until tomorrow.
+        let sched = Vault::schedule_actor();
+        let job = v.rotate_prepare(&sched, "a/old").unwrap();
+        assert!(v.due_rotations().unwrap().is_empty(), "pending rotations are not started twice");
+        v.rotate_finish(&job, Err("target down".into())).unwrap();
+        assert!(v.due_rotations().unwrap().is_empty());
+        v.db().execute("UPDATE versions SET created_at=?1 WHERE state='failed'", params![now() - 2 * 86400]).unwrap();
+        assert_eq!(v.due_rotations().unwrap(), vec!["a/old"]);
+        // Success resets the clock.
+        let job = v.rotate_prepare(&sched, "a/old").unwrap();
+        v.rotate_finish(&job, Ok(())).unwrap();
+        assert!(v.due_rotations().unwrap().is_empty());
+        assert_eq!(v.get(&root, "a/old").unwrap().versions[0].created_by, "schedule:vault");
+        v.seal(&root).unwrap();
+        assert!(matches!(v.due_rotations(), Err(VErr::Sealed)));
     }
 
     #[test]

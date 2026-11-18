@@ -3,6 +3,7 @@
 
 mod drivers;
 mod http;
+mod rotation;
 mod store;
 mod update;
 
@@ -81,6 +82,26 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // Scheduled rotations: every few minutes, rotate whatever is due. Does
+    // nothing while the vault is sealed.
+    let sched = app.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(300));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let Ok(due) = sched.vault.due_rotations() else { continue };
+            for path in due {
+                let Ok(job) = sched.vault.rotate_prepare(&store::Vault::schedule_actor(), &path) else { continue };
+                let result = drivers::run(&job.driver, &job.new_value, &job.old_value, &job.username).await;
+                match &result {
+                    Ok(()) => tracing::info!("scheduled rotation of {path} succeeded"),
+                    Err(e) => tracing::warn!("scheduled rotation of {path} failed, previous value kept: {e}"),
+                }
+                let _ = sched.vault.rotate_finish(&job, result);
+            }
+        }
+    });
     let router = http::router(app);
     let shutdown = async {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();

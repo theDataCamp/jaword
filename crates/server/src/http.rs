@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
-use crate::drivers::{self, Driver};
+use crate::drivers::{self, RotationSetup};
 use crate::store::{Actor, Meta, VErr, Vault};
 
 const AUTH_FAILS_PER_MIN: u32 = 20;
@@ -272,7 +272,24 @@ struct RevealReq {
 #[serde(deny_unknown_fields)]
 struct DriverReq {
     path: String,
-    driver: Option<Driver>,
+    driver: Option<RotationSetup>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotTargetReq {
+    host: String,
+    #[serde(default)]
+    port: Option<u16>,
+    account: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotTrustReq {
+    host: String,
+    #[serde(default)]
+    port: Option<u16>,
+    key_type: String,
+    key: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -508,6 +525,42 @@ async fn folder_delete(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap, Json(
     Ok(Json(json!({"items": n, "moved": r.move_to.is_some()})))
 }
 
+// Guided rotation setup. Admin only; each call is audited.
+
+async fn rotation_prepare(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap, Json(r): Json<RotTargetReq>) -> Res {
+    let a = actor(&app, &h, addr.ip())?;
+    let port = r.port.unwrap_or(22);
+    if !drivers::hostish(&r.host) || port == 0 || !crate::rotation::valid_account(&r.account) {
+        return Err(VErr::BadRequest("Check the server name and the account name: letters, digits, dots and dashes only.".into()).into());
+    }
+    app.vault.authorize_admin(&a, "rotation.prepare", &format!("{}:{} {}", r.host, port, r.account))?;
+    let key = crate::rotation::identity().await.map_err(VErr::Internal)?;
+    let script = crate::rotation::server_script(&r.account, &key).map_err(VErr::BadRequest)?;
+    let (host_key, scan_error) = match crate::rotation::scan(&r.host, port).await {
+        Ok(k) => (Some(k), None),
+        Err(e) => (None, Some(e)),
+    };
+    Ok(Json(json!({"public_key": key, "script": script, "host_key": host_key, "scan_error": scan_error})))
+}
+
+async fn rotation_trust(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap, Json(r): Json<RotTrustReq>) -> Res {
+    let a = actor(&app, &h, addr.ip())?;
+    let port = r.port.unwrap_or(22);
+    if !drivers::hostish(&r.host) || port == 0 {
+        return Err(VErr::BadRequest("invalid server".into()).into());
+    }
+    app.vault.authorize_admin(&a, "rotation.trust", &format!("{}:{}", r.host, port))?;
+    crate::rotation::trust(&r.host, port, &r.key_type, &r.key).await.map_err(VErr::BadRequest)?;
+    Ok(Json(json!({"trusted": true})))
+}
+
+async fn rotation_test(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap, Json(r): Json<RotTargetReq>) -> Res {
+    let a = actor(&app, &h, addr.ip())?;
+    let port = r.port.unwrap_or(22);
+    app.vault.authorize_admin(&a, "rotation.test", &format!("{}:{} {}", r.host.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')).take(64).collect::<String>(), port, r.account.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')).take(32).collect::<String>()))?;
+    ok(crate::rotation::test(&r.host, port, &r.account).await.map_err(VErr::BadRequest)?)
+}
+
 async fn tokens(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap) -> Res {
     let a = actor(&app, &h, addr.ip())?;
     ok(app.vault.list_tokens(&a)?)
@@ -594,6 +647,9 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/secrets/delete", post(delete))
         .route("/v1/secrets/driver", post(driver))
         .route("/v1/secrets/move", post(move_secret))
+        .route("/v1/rotation/prepare", post(rotation_prepare))
+        .route("/v1/rotation/trust", post(rotation_trust))
+        .route("/v1/rotation/test", post(rotation_test))
         .route("/v1/folders", get(folders))
         .route("/v1/folders/create", post(folder_create))
         .route("/v1/folders/move", post(folder_move))

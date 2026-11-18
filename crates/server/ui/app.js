@@ -362,7 +362,7 @@ async function viewSecrets(main) {
         h("td", { class: "nm" }, itemName(s), !state.folder && folderOf(s.path) && h("small", {}, folderLabel(folderOf(s.path)))),
         h("td", { class: "us" }, s.meta.username),
         h("td", {}, ageCell(s)),
-        h("td", { class: "rot" + (s.has_driver ? " auto" : "") }, s.pending_rotation ? "Pending" : s.has_driver ? "Automatic" : rotates(s) ? "By hand" : "—"),
+        h("td", { class: "rot" + (s.has_driver ? " auto" : "") }, s.pending_rotation ? "Pending" : s.has_driver ? (s.rotate_every_days ? every(s.rotate_every_days).replace(/^e/, "E") : "On request") : rotates(s) ? "By hand" : "—"),
         h("td", { class: "ver" }, s.current_version))))));
   }
 
@@ -429,7 +429,7 @@ function secretPanel(d, reload) {
   const days = daysSince(d.changed_at);
   const grade = rotates(d) ? ageGrade(days) : "green";
   const statusText = d.pending_rotation ? "Rotation pending" : grade === "red" ? "Overdue, v" + d.current_version : "Current, v" + d.current_version;
-  const drv = d.driver ? (d.driver.type === "ssh" ? `SSH to ${d.driver.host}, ${d.driver.command}` : d.driver.argv.join(" ")) : d.has_driver ? "Automatic" : "By hand";
+  const drv = d.driver ? rotationSummary(d.driver) : d.has_driver ? (d.rotate_every_days ? every(d.rotate_every_days).replace(/^e/, "E") : "On request") : "By hand";
   return h("div", { class: "insp" },
     h("div", { class: "top" },
       h("div", { class: "grow" }, h("h3", {}, m.title || pretty(leafOf(d.path))), h("div", { class: "where" }, folderLabel(folderOf(d.path)))),
@@ -448,7 +448,7 @@ function secretPanel(d, reload) {
       d.has_driver && h("button", { class: "btn go", onclick: () => confirm(`Rotate ${itemName(d)} on the live system now?`) && act("/v1/secrets/rotate", { path: d.path }, "Rotated") }, "Rotate now"),
       h("button", { class: "btn", onclick: () => secretDialog(d, reload) }, "Edit"),
       h("button", { class: "btn", onclick: () => moveDialog(d, reload) }, "Move"),
-      isAdmin() && rotates(d) && h("button", { class: "btn", onclick: () => driverDialog(d, reload) }, d.has_driver ? "Rotation setup" : "Set up rotation"),
+      isAdmin() && rotates(d) && h("button", { class: "btn", onclick: () => rotationDialog(d, reload) }, d.has_driver ? "Rotation setup" : "Set up rotation"),
       d.pending_rotation && isAdmin() && h("button", { class: "btn", onclick: () => confirm("Make the pending version the current one? Do this only if the live system already uses it.") && act("/v1/secrets/resolve", { path: d.path, promote: true }, "Pending version is now current") }, "Keep pending"),
       d.pending_rotation && isAdmin() && h("button", { class: "btn", onclick: () => confirm("Discard the pending version?") && act("/v1/secrets/resolve", { path: d.path, promote: false }, "Pending version discarded") }, "Discard pending")),
     h("div", { class: "cap sep" }, "History"),
@@ -706,29 +706,171 @@ function folderDialog(folder, done) {
   dlg.showModal();
 }
 
-function driverDialog(d, done) {
-  const presets = {
-    ssh: { type: "ssh", host: "server-name", user: "root", command: "chpasswd", stdin: "{{username}}:{{new}}\n", timeout_secs: 30 },
-    exec: { type: "exec", argv: ["/usr/local/bin/rotate-script"], stdin: "{{new}}", timeout_secs: 30 },
+// ---- rotation setup -----------------------------------------------------
+// Four short steps instead of a JSON box. What gets saved is the same setup
+// the CLI accepts; "Show technical details" displays it for the curious.
+
+const every = (n) => (!n ? "only when asked" : n === 365 ? "every year" : `every ${n} days`);
+function rotationSummary(setup) {
+  if (!setup) return "";
+  const when = setup.every_days ? every(setup.every_days).replace(/^e/, "E") : "On request";
+  return setup.type === "ssh" ? `${when}, on ${setup.host}` : `${when}, by ${setup.argv[0].split("/").pop()}`;
+}
+
+function rotationDialog(d, done) {
+  const cur = d.driver || null;
+  const m0 = cur && cur.type === "ssh" ? /^([a-z_][a-z0-9_-]*):\{\{new\}\}/.exec(cur.stdin) : null;
+  const account0 = m0 ? m0[1] : d.meta.username || "";
+  const st = {
+    step: 0,
+    how: cur && cur.type === "exec" ? "script" : "server",
+    host: cur && cur.type === "ssh" ? cur.host : "",
+    port: cur && cur.type === "ssh" ? cur.port || 22 : 22,
+    account: account0,
+    program: cur && cur.type === "exec" ? cur.argv.join(" ") : "",
+    every: cur ? cur.every_days || 0 : 90,
+    prep: null, checks: null, details: false, busy: false,
   };
-  const text = h("textarea", { spellcheck: "false", class: "code" }, JSON.stringify(d.driver || presets.ssh, null, 2));
+  const STEPS = ["How", "Where", "Check", "Schedule"];
+  const body = h("div", {});
   const err = h("div", { class: "error" });
-  async function save(driver) {
-    err.textContent = "";
-    try { await api("POST", "/v1/secrets/driver", { path: d.path, driver }); dlg.close(); toast(driver ? "Rotation set up" : "Rotation removed"); done(); }
-    catch (ex) { err.textContent = ex.message; }
+  const pattern = () => (d.meta.policy && d.meta.policy.type === "password" ? d.meta.policy.length : 24) + "-character";
+
+  function setup() {
+    const base = st.how === "server"
+      ? { type: "ssh", host: st.host.trim(), port: Number(st.port) || 22, user: "root", command: "chpasswd", stdin: `${st.account.trim()}:{{new}}\n`, timeout_secs: 30 }
+      : { type: "exec", argv: st.program.trim().split(/\s+/).filter(Boolean), stdin: "{{new}}", timeout_secs: 30 };
+    if (st.every) base.every_days = st.every;
+    return base;
   }
-  const dlg = dialog(null,
-    h("h3", {}, "Rotation for " + itemName(d)),
-    h("p", { class: "hint" }, "How the vault pushes a new password to the real system. The password is sent on the command's standard input only. Placeholders: {{new}}, {{old}}, {{username}}."),
-    h("div", { class: "row" },
-      h("button", { class: "btn small", type: "button", onclick: () => { text.value = JSON.stringify(presets.ssh, null, 2); } }, "Over SSH"),
-      h("button", { class: "btn small", type: "button", onclick: () => { text.value = JSON.stringify(presets.exec, null, 2); } }, "Program on the vault host")),
-    h("label", {}, "Setup, as JSON"), text, err,
-    h("div", { class: "actions" },
-      h("button", { class: "btn primary", type: "button", onclick: () => { let j; try { j = JSON.parse(text.value); } catch (ex) { err.textContent = "Not valid JSON: " + ex.message; return; } save(j); } }, "Save rotation setup"),
-      d.has_driver && h("button", { class: "btn danger ghost", type: "button", onclick: () => confirm("Remove rotation setup for this item?") && save(null) }, "Remove"),
-      h("button", { class: "btn ghost", type: "button", onclick: () => dlg.close() }, "Cancel")));
+  const sentence = () => {
+    const what = st.how === "server"
+      ? `the vault signs in to ${st.host.trim()} and sets a new ${pattern()} password for ${st.account.trim()}`
+      : `the vault runs ${st.program.trim().split(/\s+/)[0] || "your program"} and hands it a new ${pattern()} password`;
+    return st.every ? `${every(st.every).replace(/^e/, "E")}, ${what}. It can also be rotated on request.` : `When someone asks, ${what}.`;
+  };
+  async function busy(fn) {
+    if (st.busy) return;
+    st.busy = true; err.textContent = ""; render();
+    try { await fn(); } catch (e) { if (e.status === 401 || e.code === "sealed") { dlg.close(); return fail(e); } err.textContent = e.message; }
+    st.busy = false; render();
+  }
+  const goto = (n) => { st.step = n; err.textContent = ""; render(); };
+
+  async function prepare() {
+    st.prep = await api("POST", "/v1/rotation/prepare", { host: st.host.trim(), port: Number(st.port) || 22, account: st.account.trim() });
+    st.checks = null;
+    st.step = 2;
+  }
+  async function next() {
+    if (st.step === 0) return goto(1);
+    if (st.step === 1) {
+      if (st.how === "server") {
+        if (!st.host.trim() || !st.account.trim()) { err.textContent = "Fill in the server and the account."; return; }
+        return busy(prepare);
+      }
+      if (!st.program.trim().startsWith("/")) { err.textContent = "Give the full path of the program, starting with /."; return; }
+      return goto(3);
+    }
+    if (st.step === 2) return goto(3);
+  }
+  async function save(rotateNow) {
+    await busy(async () => {
+      await api("POST", "/v1/secrets/driver", { path: d.path, driver: setup() });
+      if (rotateNow) {
+        const r = await api("POST", "/v1/secrets/rotate", { path: d.path });
+        dlg.close(); done();
+        return r.rotated ? toast("Rotation set up, and rotated just now") : toast("Saved, but the first rotation failed. Old password kept: " + r.error, true);
+      }
+      dlg.close(); toast("Rotation set up"); done();
+    });
+  }
+
+  function stepHow() {
+    const card = (id, title, text) => h("button", { class: "choice" + (st.how === id ? " on" : ""), type: "button", "aria-pressed": st.how === id ? "true" : "false", onclick: () => { st.how = id; render(); } },
+      lamp(st.how === id ? "blue" : ""), h("span", {}, h("b", {}, title), h("small", {}, text)));
+    return [h("div", { class: "q" }, "How does this password get changed?"),
+      h("div", { class: "choices" },
+        card("server", "A user on a server", "Change a Linux or Mac account's password over SSH."),
+        card("script", "My own script", "A program on the vault host does the change, for anything else.")),
+      h("p", { class: "hint" }, "Databases and web apps do not have their own option yet; use a script for those.")];
+  }
+  function stepWhere() {
+    const bind = (key, attrs) => { const el = h("input", Object.assign({ type: "text", value: st[key], autocomplete: "off", spellcheck: "false" }, attrs)); el.addEventListener("input", () => { st[key] = el.value; }); return el; };
+    if (st.how === "script") {
+      return [h("div", { class: "q" }, "Which program?"),
+        h("label", {}, "Program on the vault host, with any arguments"), bind("program", { placeholder: "/usr/local/bin/rotate-gitea admin", class: "mono", autofocus: true }),
+        h("p", { class: "hint" }, "The new password is sent to the program's input, never on its command line. It should exit with 0 only when the change worked.")];
+    }
+    const port = bind("port", { inputmode: "numeric", "aria-label": "Port" });
+    const portRow = h("div", { hidden: Number(st.port) === 22 }, h("label", {}, "Port"), port);
+    return [h("div", { class: "q" }, "Where is it?"),
+      h("div", { class: "two" },
+        h("div", {}, h("label", {}, "Server"), bind("host", { placeholder: "name or address", autofocus: true })),
+        h("div", {}, h("label", {}, "Account whose password changes"), bind("account", { placeholder: "username on that server" }))),
+      Number(st.port) === 22 && h("p", { class: "hint" }, "Uses the standard port, 22. ", h("button", { class: "link", type: "button", onclick: (e) => { portRow.hidden = false; e.target.parentNode.hidden = true; } }, "Use another")),
+      portRow,
+      h("p", { class: "hint" }, "The vault signs in as root with its own key, limited on the server to changing this one account.")];
+  }
+  function stepCheck() {
+    const p = st.prep, k = p.host_key, c = st.checks;
+    const host = st.host.trim();
+    let ident;
+    if (!k) ident = h("div", { class: "fp" }, lamp("red"), h("span", { class: "grow" }, p.scan_error || "Could not reach the server."), h("button", { class: "link", type: "button", onclick: () => busy(prepare) }, "Try again"));
+    else {
+      const trustIt = (label, cls) => h("button", { class: cls, type: "button", onclick: () => busy(async () => { await api("POST", "/v1/rotation/trust", { host, port: Number(st.port) || 22, key_type: k.key_type, key: k.key }); k.status = "trusted"; st.checks = null; }) }, label);
+      ident = h("div", { class: "fp" }, lamp(k.status === "trusted" ? "green" : k.status === "changed" ? "red" : "amber"),
+        h("span", { class: "grow" }, h("small", {}, `${host} identifies itself as`), h("span", { class: "mono" }, k.fingerprint)),
+        k.status === "trusted" ? h("b", { class: "ok" }, "Trusted") : k.status === "changed" ? trustIt("Trust the new identity", "btn small danger outline") : trustIt("Yes, trust it", "btn small primary"));
+    }
+    const line = (ok, text) => h("li", {}, lamp(c ? (ok ? "green" : "red") : ""), text);
+    const passed = c && c.reached && c.identity && c.signed_in && c.allowed;
+    return [
+      h("div", { class: "q" }, "1.  Confirm this is the right server"), ident,
+      k && k.status === "changed" && h("p", { class: "error" }, "This is not the identity trusted before. That happens after a reinstall, or when something is impersonating the server. Only continue if you know why."),
+      k && k.status === "new" && h("p", { class: "hint" }, "To be sure, compare with the output of ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub on the server."),
+      h("div", { class: "q" }, `2.  Allow the vault on ${host}, once`),
+      h("p", { class: "hint" }, `Run this on the server as root. It lets the vault change ${st.account.trim()} and nothing else: no shell, no other accounts. Skip it if you have already done so for this account.`),
+      h("div", { class: "scriptbox" }, h("pre", { tabindex: "0" }, p.script),
+        h("button", { class: "btn small", type: "button", onclick: async () => { try { await navigator.clipboard.writeText(p.script); toast("Copied. Paste it into a root shell on " + host); } catch (_) { toast("Copy failed, select it by hand", true); } } }, "Copy")),
+      h("div", { class: "q" }, "3.  Test"),
+      h("div", { class: "testrow" },
+        h("ul", { class: "checks" }, line(c && c.reached, `Reached ${host}`), line(c && c.identity, "Server identity matches"), line(c && c.signed_in, "Signed in with the vault's key"), line(c && c.allowed, `Allowed to change ${st.account.trim()}`)),
+        h("div", { class: "aside" },
+          h("b", {}, passed ? "Ready." : c ? "Not yet." : "Nothing gets changed."), h("small", {}, passed ? "The vault can rotate this password." : c ? c.message : "The test only checks access."),
+          h("button", { class: "btn small" + (c ? "" : " primary"), type: "button", disabled: st.busy || !k || k.status !== "trusted", onclick: () => busy(async () => { st.checks = await api("POST", "/v1/rotation/test", { host, port: Number(st.port) || 22, account: st.account.trim() }); }) }, st.busy ? "Testing…" : c ? "Test again" : "Run the test")))];
+  }
+  function stepSchedule() {
+    const opt = (n, label) => h("button", { class: "seg" + (st.every === n ? " on" : ""), type: "button", "aria-pressed": st.every === n ? "true" : "false", onclick: () => { st.every = n; render(); } }, st.every === n && lamp("green"), label);
+    return [h("div", { class: "q" }, "How often should it change?"),
+      h("div", { class: "segs" }, opt(0, "Only when asked"), opt(30, "Every 30 days"), opt(90, "Every 90 days"), opt(365, "Every year")),
+      h("p", { class: "hint" }, "People and agents with the Rotate permission can still do it any time. Scheduled changes pause while the vault is sealed."),
+      h("div", { class: "q" }, "If a rotation fails"),
+      h("div", { class: "fp" }, lamp("green"), h("span", { class: "grow" }, "The old password stays in use. Nothing breaks.", h("small", {}, "The attempt is kept in the item's history, and a scheduled one is tried again the next day."))),
+      h("div", { class: "sentence" }, sentence())];
+  }
+
+  function render() {
+    const passed = st.checks && st.checks.reached && st.checks.identity && st.checks.signed_in && st.checks.allowed;
+    const last = st.step === 3;
+    // Through h() so that skipped (false) pieces are dropped, not printed.
+    body.replaceChildren(h("div", {},
+      h("h3", {}, "Set up rotation for " + itemName(d)),
+      h("ol", { class: "steps" }, STEPS.map((n, i) => (st.how === "script" && i === 2 ? null : h("li", { class: i === st.step ? "now" : i < st.step ? "done" : "" }, lamp(i < st.step ? "green" : i === st.step ? "blue" : ""), n)))),
+      ...[stepHow, stepWhere, stepCheck, stepSchedule][st.step](),
+      st.details && h("pre", { class: "details" }, JSON.stringify(setup(), null, 2)),
+      err,
+      h("div", { class: "actions" },
+        last ? h("button", { class: "btn go", type: "button", disabled: st.busy, onclick: () => save(true) }, st.busy ? "Working…" : "Save and rotate now")
+             : h("button", { class: "btn primary", type: "button", disabled: st.busy || (st.step === 2 && !passed), onclick: next }, st.busy && st.step === 1 ? "Contacting the server…" : "Continue"),
+        last && h("button", { class: "btn", type: "button", disabled: st.busy, onclick: () => save(false) }, "Save only"),
+        st.step > 0 ? h("button", { class: "btn ghost", type: "button", onclick: () => goto(st.how === "script" && st.step === 3 ? 1 : st.step - 1) }, "Back") : h("button", { class: "btn ghost", type: "button", onclick: () => dlg.close() }, "Cancel"),
+        st.step === 0 && d.has_driver && h("button", { class: "btn danger ghost", type: "button", onclick: () => confirm("Remove rotation for this item? Its password will only change by hand.") && busy(async () => { await api("POST", "/v1/secrets/driver", { path: d.path, driver: null }); dlg.close(); toast("Rotation removed"); done(); }) }, "Remove rotation"),
+        st.step > 0 && h("button", { class: "link aside-link", type: "button", onclick: () => { st.details = !st.details; render(); } }, st.details ? "Hide technical details" : "Show technical details"))));
+    const first = body.querySelector("[autofocus]"); if (first && document.activeElement === document.body) first.focus();
+  }
+  const dlg = dialog("wide", body);
+  render();
   dlg.showModal();
 }
 

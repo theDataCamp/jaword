@@ -38,6 +38,66 @@ pub enum Driver {
     },
 }
 
+/// A driver plus how often it should run on its own. Stored encrypted with
+/// the item. Older setups (a bare driver) read back with no schedule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RotationSetup {
+    #[serde(flatten)]
+    pub driver: Driver,
+    /// Rotate automatically when the value is this many days old.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every_days: Option<u32>,
+}
+
+impl From<Driver> for RotationSetup {
+    fn from(driver: Driver) -> Self {
+        RotationSetup { driver, every_days: None }
+    }
+}
+
+impl RotationSetup {
+    pub fn validate(&self) -> Result<(), String> {
+        self.driver.validate()?;
+        match self.every_days {
+            Some(d) if !(1..=3650).contains(&d) => Err("the schedule must be between 1 and 3650 days".into()),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Where the vault keeps its own SSH key and the host keys it trusts.
+pub fn ssh_dir() -> std::path::PathBuf {
+    match std::env::var_os("JAWORD_SSH_DIR") {
+        Some(d) => d.into(),
+        None => std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/var/lib/jaword".into())).join(".ssh"),
+    }
+}
+
+/// The one way the vault ever invokes ssh: its own key only, pinned host keys
+/// only, no agent, no forwarding, no terminal, nothing interactive.
+pub fn ssh_args(port: u16, user: &str, host: &str) -> Vec<String> {
+    let dir = ssh_dir();
+    let mut a: Vec<String> = Vec::new();
+    for o in [
+        "BatchMode=yes",
+        "StrictHostKeyChecking=yes",
+        "ConnectTimeout=10",
+        "ForwardAgent=no",
+        "ClearAllForwardings=yes",
+        "IdentitiesOnly=yes",
+        "GlobalKnownHostsFile=/dev/null",
+    ] {
+        a.push("-o".into());
+        a.push(o.into());
+    }
+    a.push("-o".into());
+    a.push(format!("UserKnownHostsFile={}", dir.join("known_hosts").display()));
+    a.push("-i".into());
+    a.push(dir.join("id_ed25519").display().to_string());
+    a.extend(["-T".into(), "-p".into(), port.to_string(), "-l".into(), user.to_string(), "--".into(), host.to_string()]);
+    a
+}
+
 fn d_port() -> u16 {
     22
 }
@@ -45,7 +105,7 @@ fn d_timeout() -> u64 {
     30
 }
 
-fn hostish(s: &str) -> bool {
+pub fn hostish(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 253
         && s.as_bytes()[0].is_ascii_alphanumeric()
@@ -135,17 +195,7 @@ pub async fn run(driver: &Driver, new: &str, old: &str, username: &str) -> Resul
     let (mut cmd, template, timeout) = match driver {
         Driver::Ssh { host, port, user, command, stdin, timeout_secs } => {
             let mut c = Command::new("ssh");
-            c.args([
-                "-o", "BatchMode=yes",
-                "-o", "StrictHostKeyChecking=yes",
-                "-o", "ConnectTimeout=10",
-                "-o", "ForwardAgent=no",
-                "-o", "ClearAllForwardings=yes",
-                "-T",
-                "-p", &port.to_string(),
-                "-l", user,
-                "--", host, command,
-            ]);
+            c.args(ssh_args(*port, user, host)).arg(command);
             (c, stdin, *timeout_secs)
         }
         Driver::Exec { argv, stdin, timeout_secs } => {
@@ -217,6 +267,23 @@ mod tests {
         assert!(exec(&["true"], "{{new}}").validate().is_err());
         assert!(exec(&["/bin/echo", "{{new}}"], "{{new}}").validate().is_err());
         assert!(exec(&["/usr/bin/true"], "no placeholder").validate().is_err());
+    }
+
+    #[test]
+    fn setups_with_and_without_a_schedule() {
+        // A setup saved before schedules existed is a bare driver.
+        let old: RotationSetup = serde_json::from_str(r#"{"type":"ssh","host":"h","user":"root","command":"chpasswd","stdin":"u:{{new}}\n"}"#).unwrap();
+        assert_eq!(old.every_days, None);
+        assert!(old.validate().is_ok());
+        let new: RotationSetup = serde_json::from_str(r#"{"type":"exec","argv":["/usr/bin/true"],"stdin":"{{new}}","every_days":90}"#).unwrap();
+        assert_eq!(new.every_days, Some(90));
+        let json = serde_json::to_string(&new).unwrap();
+        assert!(json.contains(r#""type":"exec""#) && json.contains(r#""every_days":90"#), "{json}");
+        assert_eq!(serde_json::from_str::<RotationSetup>(&json).unwrap(), new);
+        let mut bad = new.clone();
+        bad.every_days = Some(0);
+        assert!(bad.validate().is_err());
+        assert!(ssh_args(2222, "root", "h").windows(2).any(|w| w[0] == "-o" && w[1] == "StrictHostKeyChecking=yes"));
     }
 
     #[test]
