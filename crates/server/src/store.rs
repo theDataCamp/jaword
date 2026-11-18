@@ -182,6 +182,9 @@ pub struct SecretView {
     pub meta: Meta,
     pub has_driver: bool,
     pub pending_rotation: bool,
+    /// When the current value was set (not when metadata last changed), and by whom.
+    pub changed_at: i64,
+    pub changed_by: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -784,6 +787,14 @@ impl Vault {
             params![s.id],
             |r| r.get(0),
         )?;
+        let (changed_at, changed_by): (i64, String) = db
+            .query_row(
+                "SELECT created_at, created_by FROM versions WHERE secret_id=?1 AND version=?2",
+                params![s.id, s.current_version],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or((s.updated_at, String::new()));
         Ok(SecretView {
             path: s.path.clone(),
             kind: s.kind.clone(),
@@ -793,6 +804,8 @@ impl Vault {
             meta,
             has_driver: s.driver_blob.is_some(),
             pending_rotation: pending > 0,
+            changed_at,
+            changed_by,
         })
     }
 

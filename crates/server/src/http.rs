@@ -552,9 +552,6 @@ fn font(bytes: &'static [u8]) -> Response {
         .body(Body::from(bytes))
         .expect("static response")
 }
-async fn font_display() -> Response {
-    font(include_bytes!("../ui/fonts/besley.woff2"))
-}
 async fn font_text() -> Response {
     font(include_bytes!("../ui/fonts/atkinson-next.woff2"))
 }
@@ -577,7 +574,6 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/", get(ui_index))
         .route("/app.js", get(ui_js))
         .route("/style.css", get(ui_css))
-        .route("/fonts/besley.woff2", get(font_display))
         .route("/fonts/atkinson-next.woff2", get(font_text))
         .route("/fonts/atkinson-mono.woff2", get(font_mono))
         .route("/v1/sys/status", get(status))
