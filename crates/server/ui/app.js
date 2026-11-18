@@ -29,6 +29,43 @@ function h(tag, attrs, ...kids) {
   return el;
 }
 
+// Icons are drawn here as SVG elements (never parsed from strings).
+const SVGNS = "http://www.w3.org/2000/svg";
+const EYE = "M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12Z";
+const ICONS = {
+  eyeOpen: [["path", { d: EYE }], ["circle", { cx: 12, cy: 12, r: 3 }]],
+  eyeClosed: [["path", { d: "M3 10c2.4 3.4 5.4 5 9 5s6.6-1.6 9-5" }], ["path", { d: "M12 15v3M7.6 14.2l-1.4 2.6M16.4 14.2l1.4 2.6M4.4 11.6 2.8 13.2M19.6 11.6l1.6 1.6" }]],
+  copy: [["rect", { x: 9, y: 9, width: 11, height: 11, rx: 2 }], ["path", { d: "M5 15V6a2 2 0 0 1 2-2h9" }]],
+  check: [["path", { d: "M5 12.5l4.5 4.5L19 7.5" }]],
+  again: [["path", { d: "M20 12a8 8 0 1 1-2.6-5.9" }], ["path", { d: "M20 3.5V9h-5.5" }]],
+};
+function icon(name) {
+  const svg = document.createElementNS(SVGNS, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("class", "icon"); svg.setAttribute("aria-hidden", "true");
+  for (const [tag, attrs] of ICONS[name]) {
+    const el = document.createElementNS(SVGNS, tag);
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+    svg.append(el);
+  }
+  return svg;
+}
+// A button that is only an icon still needs a name for screen readers and a tooltip.
+function iconButton(name, label, onclick) {
+  const b = h("button", { class: "iconbtn", type: "button", title: label, "aria-label": label, onclick }, icon(name));
+  b.setIcon = (n, l) => { b.replaceChildren(icon(n)); if (l) { b.title = l; b.setAttribute("aria-label", l); } };
+  return b;
+}
+// Copy with a brief check mark in place of the icon.
+async function copyWith(button, getText, okMsg) {
+  try {
+    await navigator.clipboard.writeText(await getText());
+    button.setIcon("check"); button.classList.add("done");
+    setTimeout(() => { button.setIcon("copy"); button.classList.remove("done"); }, 1400);
+    if (okMsg) toast(okMsg);
+    return true;
+  } catch (e) { if (e && e.status) throw e; toast("Copy failed, select it by hand", true); return false; }
+}
+
 let toastTimer;
 function toast(msg, bad) {
   const t = document.getElementById("toast");
@@ -394,16 +431,18 @@ function paint(el, value) {
 
 function secretPanel(d, reload) {
   const MASK = "••••••••••••••••••••";
-  const plate = h("div", { class: "plate" }, MASK);
-  const note = h("span", { class: "hint" });
-  const toggle = h("button", { class: "link", onclick: () => (plate.className.includes("shown") ? hide() : reveal()) }, "Reveal");
-  let hideTimer, tick;
-  function hide() { clearTimeout(hideTimer); clearInterval(tick); plate.textContent = MASK; plate.className = "plate"; note.textContent = ""; toggle.textContent = "Reveal"; }
+  const val = h("div", { class: "val" }, MASK);
+  const note = h("div", { class: "hint under" });
+  let shown = false, hideTimer, tick;
+  const eye = iconButton("eyeClosed", "Show password", () => (shown ? hide() : reveal()));
+  const copyBtn = iconButton("copy", "Copy password", copy);
+  const plate = h("div", { class: "plate" }, val, h("div", { class: "tools" }, eye, copyBtn));
+  function hide() { clearTimeout(hideTimer); clearInterval(tick); shown = false; val.textContent = MASK; plate.className = "plate"; note.textContent = ""; eye.setIcon("eyeClosed", "Show password"); }
   async function fetchValue(version) { return (await api("POST", "/v1/secrets/reveal", { path: d.path, version: version || null })).value; }
   async function reveal(version) {
     try {
       const v = await fetchValue(version);
-      paint(plate, v); plate.className = "plate shown"; toggle.textContent = "Hide";
+      paint(val, v); shown = true; plate.className = "plate shown"; eye.setIcon("eyeOpen", "Hide password");
       let left = REVEAL_SECONDS;
       const label = version ? `v${version}, hides in ` : "Hides in ";
       note.textContent = `${label}${left}s`;
@@ -414,10 +453,10 @@ function secretPanel(d, reload) {
   }
   async function copy() {
     try {
-      const v = await fetchValue();
-      await navigator.clipboard.writeText(v);
-      toast("Copied. Clipboard clears in 30 seconds");
-      setTimeout(async () => { try { if (await navigator.clipboard.readText() === v) await navigator.clipboard.writeText(""); } catch (_) { /* tab not focused */ } }, 30000);
+      let v;
+      if (await copyWith(copyBtn, async () => (v = await fetchValue()), "Copied. Clipboard clears in 30 seconds")) {
+        setTimeout(async () => { try { if (await navigator.clipboard.readText() === v) await navigator.clipboard.writeText(""); } catch (_) { /* tab not focused */ } }, 30000);
+      }
     } catch (e) { fail(e); }
   }
   async function act(path, body, okMsg) {
@@ -436,8 +475,7 @@ function secretPanel(d, reload) {
     h("div", { class: "top" },
       h("div", { class: "grow" }, h("h3", {}, m.title || pretty(leafOf(d.path))), h("div", { class: "where" }, folderLabel(folderOf(d.path)))),
       h("div", { class: "status" }, lamp(d.pending_rotation ? "amber" : grade), statusText)),
-    plate,
-    h("div", { class: "under" }, toggle, h("button", { class: "link", onclick: copy }, "Copy"), note),
+    plate, note,
     h("dl", { class: "kv" },
       m.username && h("dt", {}, "Username"), m.username && h("dd", {}, m.username),
       m.url && h("dt", {}, "Website"), m.url && h("dd", {}, /^https?:\/\//i.test(m.url) ? h("a", { href: m.url, target: "_blank", rel: "noopener noreferrer" }, m.url.replace(/^https?:\/\//i, "")) : m.url),
@@ -575,11 +613,12 @@ function generator(policy) {
     }
   }
   field.addEventListener("input", () => { typed = true; meter(); });
+  const genCopy = iconButton("copy", "Copy this password", () => copyWith(genCopy, () => field.value, "Copied"));
   const el = h("div", { class: "gen" },
-    modes, field, runway, verdict, opts,
-    h("div", { class: "foot" }, h("span", { class: "hint" }, "Or type your own above"),
-      h("button", { class: "link", type: "button", onclick: roll }, "Regenerate"),
-      h("button", { class: "link", type: "button", onclick: async () => { try { await navigator.clipboard.writeText(field.value); toast("Copied"); } catch (_) { toast("Copy failed, select it by hand", true); } } }, "Copy")));
+    modes,
+    h("div", { class: "pwrow" }, field, h("div", { class: "tools" }, iconButton("again", "Make a different one", roll), genCopy)),
+    runway, verdict, opts,
+    h("div", { class: "foot" }, h("span", { class: "hint" }, "Or type your own in the field")));
   build();
   roll();
   return {
@@ -1234,7 +1273,7 @@ function tokenDialog(done) {
       form.replaceChildren(h("h3", {}, "Token created"), h("p", { class: "hint" }, "Copy it now. It is shown once and cannot be recovered."),
         h("div", { class: "once" }, r.token),
         h("div", { class: "actions" },
-          h("button", { class: "btn primary", type: "button", onclick: async () => { try { await navigator.clipboard.writeText(r.token); toast("Copied"); } catch (_) { toast("Copy failed, select it by hand", true); } } }, "Copy token"),
+          h("button", { class: "btn primary", type: "button", onclick: async (e) => { try { await navigator.clipboard.writeText(r.token); e.currentTarget.textContent = "Copied"; toast("Copied"); } catch (_) { toast("Copy failed, select it by hand", true); } } }, "Copy token"),
           h("button", { class: "btn ghost", type: "button", onclick: () => { dlg.close(); done(); } }, "Done")));
     } catch (ex) { err.textContent = ex.message; }
   } },
